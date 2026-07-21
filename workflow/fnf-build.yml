@@ -1,0 +1,91 @@
+name: FNF Haxe Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      mod_id:
+        description: 'Mod UUID'
+        required: true
+      zip_url:
+        description: 'Source ZIP download URL'
+        required: true
+      callback_url:
+        description: 'Callback URL when done'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Install Haxe 4.3.7
+        run: |
+          wget -q https://github.com/HaxeFoundation/haxe/releases/download/4.3.7/haxe-4.3.7-linux64.tar.gz
+          tar -xzf haxe-4.3.7-linux64.tar.gz
+          HAXE_DIR=$(ls -d haxe_*/ 2>/dev/null | head -1 || echo "haxe_20240108162843_e42f49b/")
+          echo "$PWD/$HAXE_DIR" >> $GITHUB_PATH
+          mkdir -p ~/haxelib
+          ./$HAXE_DIR/haxelib setup ~/haxelib --quiet || true
+
+      - name: Install Haxe libs
+        run: |
+          haxelib install lime 8.1.3 --quiet 2>&1 | tail -3
+          haxelib install openfl 9.3.4 --quiet 2>&1 | tail -3
+          haxelib install flixel 5.9.0 --quiet 2>&1 | tail -3
+          haxelib install flixel-addons 3.2.4 --quiet 2>&1 | tail -3
+          haxelib install flixel-ui 2.6.1 --quiet 2>&1 | tail -3
+          haxelib install hscript 2.5.0 --quiet 2>&1 | tail -3
+          haxelib run lime setup -y 2>&1 | tail -3
+
+      - name: Download mod ZIP
+        run: |
+          curl -L --retry 3 "${{ inputs.zip_url }}" -o mod.zip
+          unzip -q mod.zip -d mod_src
+
+      - name: Build
+        run: |
+          cd mod_src
+          PROJ=$(find . -maxdepth 4 \( -name 'Project.xml' -o -name 'project.xml' \) 2>/dev/null | head -1)
+          if [ -n "$PROJ" ]; then
+            DIR=$(dirname "$PROJ")
+            echo "Building from $DIR"
+            cd "$DIR"
+            haxelib run lime build html5 -final 2>&1
+          else
+            HXML=$(find . -maxdepth 4 -name '*.hxml' 2>/dev/null | head -1)
+            if [ -n "$HXML" ]; then
+              DIR=$(dirname "$HXML")
+              cd "$DIR"
+              haxe "$(basename $HXML)" 2>&1
+            else
+              echo "ERROR: No Project.xml or .hxml found"; exit 1
+            fi
+          fi
+
+      - name: Collect output
+        run: |
+          BUILD=$(find mod_src -type d -name 'html5' 2>/dev/null | head -1)
+          if [ -z "$BUILD" ]; then
+            BUILD=$(find mod_src -name 'index.html' -exec dirname {} \; 2>/dev/null | head -1)
+          fi
+          if [ -z "$BUILD" ]; then echo "ERROR: No build output"; exit 1; fi
+          mkdir -p /tmp/fnf_output
+          cp -r "$BUILD/." /tmp/fnf_output/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnf-build-${{ inputs.mod_id }}
+          path: /tmp/fnf_output
+          retention-days: 1
+
+      - name: Notify callback
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then S="done"; else S="error:build"; fi
+          if [ -n "${{ inputs.callback_url }}" ]; then
+            curl -s -X POST "${{ inputs.callback_url }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"status\":\"$S\",\"run_id\":\"${{ github.run_id }}\"}" || true
+          fi

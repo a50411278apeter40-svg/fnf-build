@@ -1,0 +1,106 @@
+name: FNF Mod Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      mod_id:
+        description: 'Mod UUID'
+        required: true
+      zip_url:
+        description: 'Source ZIP URL'
+        required: true
+      callback_url:
+        description: 'Callback URL (unused, kept for compat)'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Setup Haxe
+        uses: krdlab/setup-haxe@v1
+        with:
+          haxe-version: '4.3.6'
+
+      - name: Install Neko
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y neko
+
+      - name: Install haxelibs
+        run: |
+          haxelib setup ~/haxelib
+          haxelib install lime --quiet
+          haxelib install openfl --quiet
+          haxelib install flixel --quiet
+          haxelib install flixel-addons --quiet
+          haxelib run lime setup
+
+      - name: Download source ZIP
+        run: |
+          curl -L "${{ github.event.inputs.zip_url }}" -o /tmp/source.zip
+          mkdir -p /tmp/src
+          cd /tmp/src && unzip -o /tmp/source.zip
+          # 최상위 단일 폴더 자동 감지해서 진입
+          INNER=$(ls /tmp/src | head -1)
+          if [ -d "/tmp/src/$INNER" ] && [ "$(ls /tmp/src | wc -l)" = "1" ]; then
+            mv /tmp/src/$INNER /tmp/src_inner
+            mv /tmp/src_inner /tmp/src
+          fi
+          echo "Source files:"
+          ls /tmp/src/ | head -10
+
+      - name: Find Project.xml or .hxml
+        id: find_project
+        run: |
+          PROJECT=$(find /tmp/src -name "Project.xml" | head -1)
+          HXML=$(find /tmp/src -name "*.hxml" | head -1)
+          if [ -n "$PROJECT" ]; then
+            echo "type=lime" >> $GITHUB_OUTPUT
+            echo "file=$PROJECT" >> $GITHUB_OUTPUT
+            echo "cwd=$(dirname $PROJECT)" >> $GITHUB_OUTPUT
+          elif [ -n "$HXML" ]; then
+            echo "type=hxml" >> $GITHUB_OUTPUT
+            echo "file=$HXML" >> $GITHUB_OUTPUT
+            echo "cwd=$(dirname $HXML)" >> $GITHUB_OUTPUT
+          else
+            echo "type=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build HTML5 (lime)
+        if: steps.find_project.outputs.type == 'lime'
+        working-directory: ${{ steps.find_project.outputs.cwd }}
+        run: |
+          mkdir -p export/html5/bin export/release/html5/bin export/final/html5/bin
+          haxelib run lime build html5 -final 2>&1
+          echo "Build exit: $?"
+
+      - name: Build HTML5 (hxml)
+        if: steps.find_project.outputs.type == 'hxml'
+        working-directory: ${{ steps.find_project.outputs.cwd }}
+        run: |
+          haxe "${{ steps.find_project.outputs.file }}"
+
+      - name: Collect build output
+        run: |
+          mkdir -p /tmp/build_output
+          # lime 빌드 결과물 탐색
+          BUILD_SRC=$(find /tmp/src -name "index.html" | head -1 | xargs dirname 2>/dev/null || true)
+          if [ -n "$BUILD_SRC" ]; then
+            cp -r "$BUILD_SRC"/. /tmp/build_output/
+            echo "Collected from: $BUILD_SRC"
+          else
+            echo "index.html not found!"
+            find /tmp/src -name "*.js" | head -5
+            exit 1
+          fi
+          ls /tmp/build_output/ | head -10
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnf-build-${{ github.event.inputs.mod_id }}
+          path: /tmp/build_output/
+          retention-days: 1

@@ -24,7 +24,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y neko unzip
+          sudo apt-get install -y neko unzip libgl1 libglu1-mesa
 
       - name: Download & extract source ZIP
         run: |
@@ -60,13 +60,10 @@ jobs:
         if: steps.ziptype.outputs.mode == 'mod_only'
         run: |
           mkdir -p $GITHUB_WORKSPACE/psych_src $GITHUB_WORKSPACE/build_project
-
           HTTP=$(curl -sL -w "%{http_code}" \
             "https://github.com/ShadowMario/FNF-PsychEngine/archive/refs/heads/main.zip" \
             -o $GITHUB_WORKSPACE/psych_base.zip)
           SZ=$(wc -c < $GITHUB_WORKSPACE/psych_base.zip)
-          echo "HTTP=$HTTP SIZE=$SZ"
-
           if [ "$HTTP" = "200" ] && [ "$SZ" -gt 100000 ]; then
             unzip -q $GITHUB_WORKSPACE/psych_base.zip -d $GITHUB_WORKSPACE/psych_src
             BASE_DIR=$(ls $GITHUB_WORKSPACE/psych_src | head -1)
@@ -86,76 +83,70 @@ jobs:
         run: |
           SRC=$GITHUB_WORKSPACE/mod_src
           DST=$GITHUB_WORKSPACE/build_project
-
-          # assets 폴더 통째 병합
           for MOD_ASSETS in $(find $SRC -maxdepth 2 -type d -name "assets" | head -3); do
             mkdir -p $DST/assets
             cp -r "$MOD_ASSETS/." $DST/assets/ 2>/dev/null || true
-            echo "병합: $MOD_ASSETS"
           done
-
-          # 개별 서브폴더
           for SUBDIR in songs images music data videos characters stages; do
             MOD_SUB=$(find $SRC -maxdepth 3 -type d -name "$SUBDIR" | head -1 || true)
             if [ -n "$MOD_SUB" ]; then
               mkdir -p "$DST/assets/$SUBDIR"
               cp -r "$MOD_SUB/." "$DST/assets/$SUBDIR/" 2>/dev/null || true
-              echo "병합 $SUBDIR: $MOD_SUB"
             fi
           done
-
-          # .hx 소스 병합
           find $SRC -maxdepth 3 -name "*.hx" | head -30 | while read HX_FILE; do
             REL=$(realpath --relative-to=$SRC "$HX_FILE" 2>/dev/null || basename "$HX_FILE")
             TARGET_DIR="$DST/$(dirname $REL)"
             mkdir -p "$TARGET_DIR"
             cp "$HX_FILE" "$TARGET_DIR/" 2>/dev/null || true
           done
-
-          echo "=== 병합 후 ===" && ls $DST | head -15
-
-          # build_project 내용을 mod_src로 덮어씌우기 (기존 mod_src 내용 보존 후 merge)
           cp -r $DST/. $GITHUB_WORKSPACE/mod_src/
+          echo "=== 병합 후 ===" && ls $GITHUB_WORKSPACE/mod_src | head -15
 
-      - name: Detect versions
-        id: vers
-        run: |
-          SRC=$GITHUB_WORKSPACE/mod_src
-          PX=$(find $SRC -maxdepth 4 \( -name "Project.xml" -o -name "project.xml" -o -name "application.xml" \) | head -1 || true)
-          if [ -n "$PX" ]; then
-            echo "=== Project.xml ===" && grep -i haxelib "$PX" || true
-            extract() { grep -oP "(?<=name=\"$1\" version=\")[^\"]+" "$PX" 2>/dev/null | head -1 || true; }
-            echo "lime_ver=$(extract lime)"            >> $GITHUB_OUTPUT
-            echo "openfl_ver=$(extract openfl)"        >> $GITHUB_OUTPUT
-            echo "flixel_ver=$(extract flixel)"        >> $GITHUB_OUTPUT
-            echo "addons_ver=$(extract flixel-addons)" >> $GITHUB_OUTPUT
-            echo "hxcpp_ver=$(extract hxcpp)"          >> $GITHUB_OUTPUT
-          fi
-
-      - name: Install haxelibs
+      - name: Install ALL haxelibs from Project.xml
         run: |
           haxelib setup ~/haxelib
 
-          inst() {
-            local LIB=$1 VER=$2
-            if [ -n "$VER" ]; then
-              echo "==> $LIB@$VER"
-              haxelib install "$LIB" "$VER" --quiet 2>&1 | grep -v "^[0-9]" || true
-              haxelib set "$LIB" "$VER" 2>/dev/null || true
-            else
-              echo "==> $LIB (latest)"
-              haxelib install "$LIB" --quiet 2>&1 | grep -v "^[0-9]" || true
-            fi
-          }
+          SRC=$GITHUB_WORKSPACE/mod_src
+          PX=$(find $SRC -maxdepth 4 \( -name "Project.xml" -o -name "project.xml" -o -name "application.xml" \) | head -1 || true)
 
-          inst lime          "${{ steps.vers.outputs.lime_ver }}"
-          inst openfl        "${{ steps.vers.outputs.openfl_ver }}"
-          inst flixel        "${{ steps.vers.outputs.flixel_ver }}"
-          inst flixel-addons "${{ steps.vers.outputs.addons_ver }}"
-          inst hxcpp         "${{ steps.vers.outputs.hxcpp_ver }}"
+          # ── 기본 필수 라이브러리 먼저 설치 ──
+          for LIB in lime openfl flixel flixel-addons hxcpp tjson hscript hxcodec polymod; do
+            echo "==> [기본] $LIB"
+            haxelib install "$LIB" --quiet 2>&1 | tail -2 || true
+          done
 
+          # ── Project.xml에서 모든 <haxelib> 항목 자동 파싱 & 설치 ──
+          if [ -n "$PX" ]; then
+            echo "=== Project.xml haxelib 파싱 ==="
+            # name 속성 추출
+            grep -oP '(?<=<haxelib name=")[^"]+' "$PX" 2>/dev/null | sort -u | while read LIB; do
+              # version 속성 추출 (같은 줄)
+              VER=$(grep "name=\"$LIB\"" "$PX" | grep -oP '(?<=version=")[^"]+' | head -1 || true)
+              if [ -n "$VER" ]; then
+                echo "==> [Project.xml] $LIB@$VER"
+                haxelib install "$LIB" "$VER" --quiet 2>&1 | tail -2 || true
+                haxelib set "$LIB" "$VER" 2>/dev/null || true
+              else
+                echo "==> [Project.xml] $LIB (latest)"
+                haxelib install "$LIB" --quiet 2>&1 | tail -2 || true
+              fi
+            done
+
+            # ── .hxml 내 -lib 항목도 파싱 ──
+            find $SRC -maxdepth 4 -name "*.hxml" | while read HXML; do
+              grep -oP '(?<=-lib )\S+' "$HXML" 2>/dev/null | while read LIB; do
+                echo "==> [hxml] $LIB"
+                haxelib install "$LIB" --quiet 2>&1 | tail -2 || true
+              done
+            done
+          fi
+
+          # ── lime setup (C++ 바인딩 활성화) ──
+          echo "==> lime setup"
           haxelib run lime setup 2>/dev/null || true
-          echo "=== installed ===" && haxelib list
+
+          echo "=== 설치된 라이브러리 ===" && haxelib list
 
       - name: Build
         run: |
@@ -165,7 +156,7 @@ jobs:
           mkdir -p $GITHUB_WORKSPACE/out
 
           if [ -n "$PX" ]; then
-            echo "==> lime build: $PX"
+            echo "==> lime build html5: $PX"
             CWD=$(dirname "$PX")
             for d in export export/html5 export/html5/bin \
                      export/release export/release/html5 export/release/html5/bin \

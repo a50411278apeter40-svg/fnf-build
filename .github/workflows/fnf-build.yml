@@ -7,100 +7,219 @@ on:
         description: 'Mod UUID'
         required: true
       zip_url:
-        description: 'Source ZIP URL'
+        description: 'Source ZIP download URL'
         required: true
-      callback_url:
-        description: 'Callback URL (unused, kept for compat)'
-        required: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
-      - name: Setup Haxe
+      - name: Setup Haxe 4.3.6
         uses: krdlab/setup-haxe@v1
         with:
           haxe-version: '4.3.6'
 
-      - name: Install Neko
+      - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y neko
+          sudo apt-get install -y neko unzip
 
-      - name: Install haxelibs
+      - name: Checkout FNF base repo
+        uses: actions/checkout@v4
+        with:
+          path: /tmp/fnf_base
+
+      - name: Download & extract source ZIP
+        run: |
+          curl -fL "${{ github.event.inputs.zip_url }}" -o /tmp/source.zip
+          mkdir -p /tmp/src
+          unzip -o /tmp/source.zip -d /tmp/src_raw
+          # 최상위 단일 폴더면 내용물을 바깥으로
+          COUNT=$(ls /tmp/src_raw | wc -l)
+          INNER=$(ls /tmp/src_raw | head -1)
+          if [ "$COUNT" = "1" ] && [ -d "/tmp/src_raw/$INNER" ]; then
+            cp -r "/tmp/src_raw/$INNER/." /tmp/src/
+          else
+            cp -r /tmp/src_raw/. /tmp/src/
+          fi
+          echo "=== ZIP 내부 파일 목록 ===" && ls /tmp/src/ | head -20
+
+      - name: Detect ZIP type (full project vs mod-only)
+        id: ziptype
+        run: |
+          HAS_PROJECT=$(find /tmp/src -maxdepth 3 \( -name "Project.xml" -o -name "project.xml" -o -name "application.xml" \) | head -1 || true)
+          HAS_HXML=$(find /tmp/src -maxdepth 3 -name "*.hxml" | head -1 || true)
+          HAS_HAXE=$(find /tmp/src -maxdepth 3 -name "*.hx" | head -1 || true)
+          HAS_ASSETS=$(find /tmp/src -maxdepth 3 -type d \( -name "assets" -o -name "songs" -o -name "images" -o -name "music" \) | head -1 || true)
+
+          echo "has_project=$HAS_PROJECT"
+          echo "has_hxml=$HAS_HXML"
+          echo "has_haxe=$HAS_HAXE"
+          echo "has_assets=$HAS_ASSETS"
+
+          if [ -n "$HAS_PROJECT" ] || [ -n "$HAS_HXML" ]; then
+            echo "mode=full_project" >> $GITHUB_OUTPUT
+            echo "✅ 전체 프로젝트 ZIP 감지"
+          else
+            echo "mode=mod_only" >> $GITHUB_OUTPUT
+            echo "✅ 모드 에셋 전용 ZIP 감지 → base 프로젝트에 병합"
+          fi
+
+      - name: Prepare full FNF base project (mod-only ZIP)
+        if: steps.ziptype.outputs.mode == 'mod_only'
+        run: |
+          # FNF Psych Engine base 다운로드
+          echo "==> FNF Psych Engine base 다운로드 중..."
+          curl -fL "https://github.com/ShadowMario/FNF-PsychEngine/archive/refs/heads/main.zip" \
+            -o /tmp/psych_base.zip 2>&1 | tail -5 || true
+
+          if [ -f /tmp/psych_base.zip ] && [ $(wc -c < /tmp/psych_base.zip) -gt 100000 ]; then
+            mkdir -p /tmp/psych_src
+            unzip -q /tmp/psych_base.zip -d /tmp/psych_src
+            BASE_DIR=$(ls /tmp/psych_src | head -1)
+            cp -r "/tmp/psych_src/$BASE_DIR/." /tmp/build_project/
+            echo "✅ Psych Engine base 준비 완료"
+          else
+            # fallback: vanilla FNF
+            echo "==> Psych Engine 다운로드 실패 → Vanilla FNF 사용"
+            curl -fL "https://github.com/FunkinCrew/Funkin/archive/refs/heads/main.zip" \
+              -o /tmp/vanilla_base.zip 2>&1 | tail -5 || true
+            mkdir -p /tmp/vanilla_src
+            unzip -q /tmp/vanilla_base.zip -d /tmp/vanilla_src || true
+            BASE_DIR=$(ls /tmp/vanilla_src | head -1)
+            cp -r "/tmp/vanilla_src/$BASE_DIR/." /tmp/build_project/ || true
+          fi
+
+          mkdir -p /tmp/build_project
+
+          # 모드 파일을 base 프로젝트에 덮어쓰기 병합
+          echo "==> 모드 파일을 base에 병합..."
+
+          # assets 폴더 병합
+          for MOD_ASSETS in $(find /tmp/src -maxdepth 2 -type d -name "assets" | head -3); do
+            echo "병합: $MOD_ASSETS → /tmp/build_project/assets/"
+            cp -r "$MOD_ASSETS/." /tmp/build_project/assets/ 2>/dev/null || true
+          done
+
+          # songs / images / music / data / videos 폴더 병합
+          for SUBDIR in songs images music data videos characters stages; do
+            MOD_SUB=$(find /tmp/src -maxdepth 3 -type d -name "$SUBDIR" | head -1 || true)
+            if [ -n "$MOD_SUB" ]; then
+              TARGET="/tmp/build_project/assets/$SUBDIR"
+              mkdir -p "$TARGET"
+              cp -r "$MOD_SUB/." "$TARGET/" 2>/dev/null || true
+              echo "병합: $MOD_SUB → $TARGET"
+            fi
+          done
+
+          # 루트 Haxe 소스(.hx) 병합
+          for HX_FILE in $(find /tmp/src -maxdepth 3 -name "*.hx" | head -20); do
+            REL=$(realpath --relative-to=/tmp/src "$HX_FILE" 2>/dev/null || basename "$HX_FILE")
+            TARGET_DIR="/tmp/build_project/$(dirname $REL)"
+            mkdir -p "$TARGET_DIR"
+            cp "$HX_FILE" "$TARGET_DIR/" 2>/dev/null || true
+          done
+
+          echo "=== 병합 후 build_project 루트 ===" && ls /tmp/build_project/ | head -15
+          # 이후 /tmp/src를 /tmp/build_project 로 교체
+          cp -r /tmp/build_project/. /tmp/src/ 2>/dev/null || true
+
+      - name: Detect haxelib versions from Project.xml
+        id: vers
+        run: |
+          PX=$(find /tmp/src -maxdepth 4 \( -name "Project.xml" -o -name "project.xml" -o -name "application.xml" \) | head -1 || true)
+          if [ -n "$PX" ]; then
+            echo "=== Project.xml haxelib entries ===" && grep -i haxelib "$PX" || true
+            extract() { grep -oP "(?<=name=\"$1\" version=\")[^\"]+" "$PX" 2>/dev/null | head -1 || true; }
+            echo "lime_ver=$(extract lime)"             >> $GITHUB_OUTPUT
+            echo "openfl_ver=$(extract openfl)"         >> $GITHUB_OUTPUT
+            echo "flixel_ver=$(extract flixel)"         >> $GITHUB_OUTPUT
+            echo "addons_ver=$(extract flixel-addons)"  >> $GITHUB_OUTPUT
+            echo "hxcpp_ver=$(extract hxcpp)"           >> $GITHUB_OUTPUT
+            echo "Project.xml: $PX"
+          else
+            echo "Project.xml 없음 — 기본 버전 사용"
+          fi
+
+      - name: Install haxelibs (version-aware)
         run: |
           haxelib setup ~/haxelib
-          haxelib install lime --quiet
-          haxelib install openfl --quiet
-          haxelib install flixel --quiet
-          haxelib install flixel-addons --quiet
-          haxelib run lime setup
 
-      - name: Download source ZIP
-        run: |
-          curl -L "${{ github.event.inputs.zip_url }}" -o /tmp/source.zip
-          mkdir -p /tmp/src
-          cd /tmp/src && unzip -o /tmp/source.zip
-          # 최상위 단일 폴더 자동 감지해서 진입
-          INNER=$(ls /tmp/src | head -1)
-          if [ -d "/tmp/src/$INNER" ] && [ "$(ls /tmp/src | wc -l)" = "1" ]; then
-            mv /tmp/src/$INNER /tmp/src_inner
-            mv /tmp/src_inner /tmp/src
-          fi
-          echo "Source files:"
-          ls /tmp/src/ | head -10
+          inst() {
+            local LIB=$1 VER=$2
+            if [ -n "$VER" ]; then
+              echo "==> $LIB $VER"
+              haxelib install "$LIB" "$VER" --quiet 2>&1 | grep -v "^[0-9]" || true
+              haxelib set "$LIB" "$VER" 2>/dev/null || true
+            else
+              echo "==> $LIB (latest)"
+              haxelib install "$LIB" --quiet 2>&1 | grep -v "^[0-9]" || true
+            fi
+          }
 
-      - name: Find Project.xml or .hxml
-        id: find_project
+          inst lime          "${{ steps.vers.outputs.lime_ver }}"
+          inst openfl        "${{ steps.vers.outputs.openfl_ver }}"
+          inst flixel        "${{ steps.vers.outputs.flixel_ver }}"
+          inst flixel-addons "${{ steps.vers.outputs.addons_ver }}"
+          inst hxcpp         "${{ steps.vers.outputs.hxcpp_ver }}"
+
+          echo "==> lime setup"
+          haxelib run lime setup 2>/dev/null || true
+
+          echo "=== installed ===" && haxelib list
+
+      - name: Find build entry
+        id: entry
         run: |
-          PROJECT=$(find /tmp/src -name "Project.xml" | head -1)
-          HXML=$(find /tmp/src -name "*.hxml" | head -1)
-          if [ -n "$PROJECT" ]; then
-            echo "type=lime" >> $GITHUB_OUTPUT
-            echo "file=$PROJECT" >> $GITHUB_OUTPUT
-            echo "cwd=$(dirname $PROJECT)" >> $GITHUB_OUTPUT
-          elif [ -n "$HXML" ]; then
-            echo "type=hxml" >> $GITHUB_OUTPUT
-            echo "file=$HXML" >> $GITHUB_OUTPUT
-            echo "cwd=$(dirname $HXML)" >> $GITHUB_OUTPUT
+          PX=$(find /tmp/src -maxdepth 4 \( -name "Project.xml" -o -name "project.xml" -o -name "application.xml" \) | head -1 || true)
+          HX=$(find /tmp/src -maxdepth 4 -name "*.hxml" | head -1 || true)
+          if [ -n "$PX" ]; then
+            echo "type=lime"           >> $GITHUB_OUTPUT
+            echo "cwd=$(dirname $PX)" >> $GITHUB_OUTPUT
+            echo "Found: $PX"
+          elif [ -n "$HX" ]; then
+            echo "type=hxml"              >> $GITHUB_OUTPUT
+            echo "cwd=$(dirname $HX)"   >> $GITHUB_OUTPUT
+            echo "hxml=$(basename $HX)" >> $GITHUB_OUTPUT
+            echo "Found: $HX"
           else
             echo "type=none" >> $GITHUB_OUTPUT
+            echo "❌ 빌드 진입점 없음"
+            find /tmp/src -type f | head -30
           fi
 
-      - name: Build HTML5 (lime)
-        if: steps.find_project.outputs.type == 'lime'
-        working-directory: ${{ steps.find_project.outputs.cwd }}
+      - name: Build lime → HTML5
+        if: steps.entry.outputs.type == 'lime'
+        working-directory: ${{ steps.entry.outputs.cwd }}
         run: |
-          mkdir -p export/html5/bin export/release/html5/bin export/final/html5/bin
-          haxelib run lime build html5 -final 2>&1
-          echo "Build exit: $?"
+          for d in export export/html5 export/html5/bin \
+                   export/release export/release/html5 export/release/html5/bin \
+                   export/final export/final/html5 export/final/html5/bin; do
+            mkdir -p "$d"
+          done
+          haxelib run lime build html5 -final
 
-      - name: Build HTML5 (hxml)
-        if: steps.find_project.outputs.type == 'hxml'
-        working-directory: ${{ steps.find_project.outputs.cwd }}
-        run: |
-          haxe "${{ steps.find_project.outputs.file }}"
+      - name: Build hxml
+        if: steps.entry.outputs.type == 'hxml'
+        working-directory: ${{ steps.entry.outputs.cwd }}
+        run: haxe "${{ steps.entry.outputs.hxml }}"
 
-      - name: Collect build output
+      - name: Collect output
         run: |
-          mkdir -p /tmp/build_output
-          # lime 빌드 결과물 탐색
-          BUILD_SRC=$(find /tmp/src -name "index.html" | head -1 | xargs dirname 2>/dev/null || true)
-          if [ -n "$BUILD_SRC" ]; then
-            cp -r "$BUILD_SRC"/. /tmp/build_output/
-            echo "Collected from: $BUILD_SRC"
+          mkdir -p /tmp/out
+          IDX=$(find /tmp/src -name "index.html" | head -1 || true)
+          if [ -n "$IDX" ]; then
+            cp -r "$(dirname $IDX)"/. /tmp/out/
+            echo "✅ 수집 완료: $(dirname $IDX)" && ls /tmp/out/ | head -10
           else
-            echo "index.html not found!"
-            find /tmp/src -name "*.js" | head -5
-            exit 1
+            echo "❌ index.html 없음" && find /tmp/src -type f | head -20 && exit 1
           fi
-          ls /tmp/build_output/ | head -10
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: fnf-build-${{ github.event.inputs.mod_id }}
-          path: /tmp/build_output/
+          path: /tmp/out/
           retention-days: 1

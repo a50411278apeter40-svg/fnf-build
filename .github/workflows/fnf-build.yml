@@ -26,20 +26,22 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y neko unzip libgl1 libglu1-mesa
 
-      - name: Download & extract source ZIP
+      - name: Download source ZIP from GitHub Release
         run: |
           mkdir -p $GITHUB_WORKSPACE/mod_src
-          curl -fL "${{ github.event.inputs.zip_url }}" -o $GITHUB_WORKSPACE/source.zip
-          unzip -o $GITHUB_WORKSPACE/source.zip -d $GITHUB_WORKSPACE/src_raw
-
-          COUNT=$(ls $GITHUB_WORKSPACE/src_raw | wc -l)
-          INNER=$(ls $GITHUB_WORKSPACE/src_raw | head -1)
-          if [ "$COUNT" = "1" ] && [ -d "$GITHUB_WORKSPACE/src_raw/$INNER" ]; then
-            cp -r "$GITHUB_WORKSPACE/src_raw/$INNER/." $GITHUB_WORKSPACE/mod_src/
-          else
-            cp -r $GITHUB_WORKSPACE/src_raw/. $GITHUB_WORKSPACE/mod_src/
+          curl -L --retry 3 --retry-delay 2 --max-time 60 \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "${{ github.event.inputs.zip_url }}" \
+            -o /tmp/source.zip
+          ls -lh /tmp/source.zip
+          unzip -o /tmp/source.zip -d $GITHUB_WORKSPACE/mod_src
+          ITEMS=$(ls $GITHUB_WORKSPACE/mod_src | wc -l)
+          FIRST=$(ls $GITHUB_WORKSPACE/mod_src | head -1)
+          if [ "$ITEMS" = "1" ] && [ -d "$GITHUB_WORKSPACE/mod_src/$FIRST" ]; then
+            mv "$GITHUB_WORKSPACE/mod_src/$FIRST/"* "$GITHUB_WORKSPACE/mod_src/" 2>/dev/null || true
+            rmdir "$GITHUB_WORKSPACE/mod_src/$FIRST" 2>/dev/null || true
           fi
-          echo "=== ZIP 내부 ===" && ls $GITHUB_WORKSPACE/mod_src/ | head -20
+          ls $GITHUB_WORKSPACE/mod_src | head -15
 
       - name: Detect ZIP type
         id: ziptype

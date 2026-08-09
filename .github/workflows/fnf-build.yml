@@ -16,93 +16,99 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
-      - name: Setup Haxe
+      - name: Setup Haxe 4.3.6
         uses: krdlab/setup-haxe@v1
         with:
           haxe-version: '4.3.6'
 
-      - name: Install Neko
+      - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y neko
+          sudo apt-get install -y neko rsync unzip
 
       - name: Download source ZIP from GitHub Release
         run: |
           mkdir -p $GITHUB_WORKSPACE/mod_src
           echo "다운로드 URL: ${{ github.event.inputs.zip_url }}"
-          curl -L --retry 3 --retry-delay 2 --max-time 60 \
+          curl -L --retry 3 --retry-delay 2 --max-time 120 \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "${{ github.event.inputs.zip_url }}" \
             -o /tmp/source.zip
           ls -lh /tmp/source.zip
           unzip -o /tmp/source.zip -d $GITHUB_WORKSPACE/mod_src
+          # 최상위 폴더 1개면 그 안으로 이동
           ITEMS=$(ls $GITHUB_WORKSPACE/mod_src | wc -l)
           FIRST=$(ls $GITHUB_WORKSPACE/mod_src | head -1)
           if [ "$ITEMS" = "1" ] && [ -d "$GITHUB_WORKSPACE/mod_src/$FIRST" ]; then
             mv "$GITHUB_WORKSPACE/mod_src/$FIRST/"* "$GITHUB_WORKSPACE/mod_src/" 2>/dev/null || true
             rmdir "$GITHUB_WORKSPACE/mod_src/$FIRST" 2>/dev/null || true
           fi
-          echo "소스 파일 목록:"
-          ls $GITHUB_WORKSPACE/mod_src | head -15
+          echo "=== 소스 파일 목록 ==="
+          ls $GITHUB_WORKSPACE/mod_src | head -20
 
-      - name: Detect required haxelib versions from Project.xml
-        id: detect_versions
+      - name: Parse Project.xml versions
+        id: versions
         run: |
           PROJECT=$(find $GITHUB_WORKSPACE/mod_src -name "Project.xml" | head -1 || true)
           if [ -n "$PROJECT" ]; then
             echo "=== Project.xml haxelib entries ==="
             grep -i "haxelib" "$PROJECT" || true
-            FLIXEL_VER=$(grep -oP '(?<=name="flixel" version=")[^"]+' "$PROJECT" || true)
-            FLIXEL_ADDONS_VER=$(grep -oP '(?<=name="flixel-addons" version=")[^"]+' "$PROJECT" || true)
-            LIME_VER=$(grep -oP '(?<=name="lime" version=")[^"]+' "$PROJECT" || true)
-            OPENFL_VER=$(grep -oP '(?<=name="openfl" version=")[^"]+' "$PROJECT" || true)
-            HXCPP_VER=$(grep -oP '(?<=name="hxcpp" version=")[^"]+' "$PROJECT" || true)
-            echo "flixel_ver=${FLIXEL_VER}" >> $GITHUB_OUTPUT
-            echo "flixel_addons_ver=${FLIXEL_ADDONS_VER}" >> $GITHUB_OUTPUT
-            echo "lime_ver=${LIME_VER}" >> $GITHUB_OUTPUT
-            echo "openfl_ver=${OPENFL_VER}" >> $GITHUB_OUTPUT
-            echo "hxcpp_ver=${HXCPP_VER}" >> $GITHUB_OUTPUT
-            echo "Detected: flixel=$FLIXEL_VER openfl=$OPENFL_VER lime=$LIME_VER hxcpp=$HXCPP_VER"
+            get_ver() { grep -oP "(?<=name=\"$1\" version=\")[^\"]+" "$PROJECT" 2>/dev/null || echo ""; }
+            echo "flixel=$(get_ver flixel)"           >> $GITHUB_OUTPUT
+            echo "flixel_addons=$(get_ver flixel-addons)" >> $GITHUB_OUTPUT
+            echo "lime=$(get_ver lime)"               >> $GITHUB_OUTPUT
+            echo "openfl=$(get_ver openfl)"           >> $GITHUB_OUTPUT
+            echo "hxcpp=$(get_ver hxcpp)"             >> $GITHUB_OUTPUT
+            echo "tjson=$(get_ver tjson)"             >> $GITHUB_OUTPUT
+            echo "hscript=$(get_ver hscript)"         >> $GITHUB_OUTPUT
+            echo "hxcodec=$(get_ver hxCodec)"         >> $GITHUB_OUTPUT
+            echo "polymod=$(get_ver polymod)"         >> $GITHUB_OUTPUT
           fi
 
-      - name: Install haxelibs
+      - name: Install ALL haxelibs
         run: |
           haxelib setup ~/haxelib
 
           install_lib() {
-            LIB=$1; VER=$2
+            local LIB=$1 VER=$2
             if [ -n "$VER" ]; then
-              echo "==> $LIB $VER 설치"
-              haxelib install "$LIB" "$VER" --quiet 2>&1 | grep -v "^[0-9]" || true
+              echo "==> $LIB@$VER"
+              haxelib install "$LIB" "$VER" --quiet 2>&1 | tail -3 || true
               haxelib set "$LIB" "$VER" 2>/dev/null || true
             else
-              echo "==> $LIB (latest) 설치"
-              haxelib install "$LIB" --quiet 2>&1 | grep -v "^[0-9]" || true
+              echo "==> $LIB (latest)"
+              haxelib install "$LIB" --quiet 2>&1 | tail -3 || true
             fi
           }
 
-          install_lib lime      "${{ steps.detect_versions.outputs.lime_ver }}"
-          install_lib openfl    "${{ steps.detect_versions.outputs.openfl_ver }}"
-          install_lib flixel    "${{ steps.detect_versions.outputs.flixel_ver }}"
-          install_lib flixel-addons "${{ steps.detect_versions.outputs.flixel_addons_ver }}"
-          if [ -n "${{ steps.detect_versions.outputs.hxcpp_ver }}" ]; then
-            install_lib hxcpp "${{ steps.detect_versions.outputs.hxcpp_ver }}"
-          else
-            install_lib hxcpp ""
-          fi
+          # 핵심 라이브러리 (Project.xml 버전 우선, 없으면 latest)
+          install_lib lime            "${{ steps.versions.outputs.lime }}"
+          install_lib openfl          "${{ steps.versions.outputs.openfl }}"
+          install_lib flixel          "${{ steps.versions.outputs.flixel }}"
+          install_lib flixel-addons   "${{ steps.versions.outputs.flixel_addons }}"
+          install_lib hxcpp           "${{ steps.versions.outputs.hxcpp }}"
 
-          # Project.xml 전체 파싱 → 추가 haxelib 자동 설치
+          # Psych Engine 필수 라이브러리 (버전 지정 없으면 latest)
+          install_lib tjson           "${{ steps.versions.outputs.tjson }}"
+          install_lib hscript         "${{ steps.versions.outputs.hscript }}"
+          install_lib hxCodec         "${{ steps.versions.outputs.hxcodec }}"
+          install_lib polymod         "${{ steps.versions.outputs.polymod }}"
+          install_lib flixel-tools    ""
+          install_lib actuate         ""
+          install_lib hxp             ""
+
+          # Project.xml 전체 파싱 → 나머지 haxelib 자동 설치
           PROJECT=$(find $GITHUB_WORKSPACE/mod_src -name "Project.xml" | head -1 || true)
           if [ -n "$PROJECT" ]; then
             python3 << 'PY'
-          import xml.etree.ElementTree as ET, subprocess, sys, os
-          already = {"lime","openfl","flixel","flixel-addons","hxcpp"}
-          proj = os.environ.get("PROJECT","")
+          import xml.etree.ElementTree as ET, subprocess, os
+          already = {"lime","openfl","flixel","flixel-addons","hxcpp",
+                     "tjson","hscript","hxCodec","polymod","flixel-tools","actuate","hxp"}
           try:
-              tree = ET.parse(proj)
+              tree = ET.parse(os.environ.get("PROJECT",""))
               for el in tree.iter():
                   if el.tag == "haxelib":
                       name = el.get("name","").strip()
@@ -110,14 +116,12 @@ jobs:
                       if name and name not in already:
                           already.add(name)
                           cmd = ["haxelib","install",name,"--quiet"]
-                          if ver:
-                              cmd.insert(2, ver)
-                          print(f"==> 추가 설치: {name} {ver or '(latest)'}")
+                          if ver: cmd.insert(2, ver)
+                          print(f"==> 추가: {name} {ver or '(latest)'}")
                           subprocess.run(cmd, check=False)
-                          if ver:
-                              subprocess.run(["haxelib","set",name,ver], check=False)
+                          if ver: subprocess.run(["haxelib","set",name,ver], check=False)
           except Exception as e:
-              print(f"[WARN] Project.xml 파싱 오류: {e}", file=sys.stderr)
+              print(f"[WARN] {e}")
           PY
           fi
 
@@ -131,64 +135,65 @@ jobs:
           PROJECT=$(find $GITHUB_WORKSPACE/mod_src -name "Project.xml" | head -1 || true)
           HXML=$(find $GITHUB_WORKSPACE/mod_src -name "*.hxml" | head -1 || true)
           if [ -n "$PROJECT" ]; then
-            echo "type=lime" >> $GITHUB_OUTPUT
-            echo "file=$PROJECT" >> $GITHUB_OUTPUT
-            echo "cwd=$(dirname $PROJECT)" >> $GITHUB_OUTPUT
+            echo "type=lime"                    >> $GITHUB_OUTPUT
+            echo "file=$PROJECT"               >> $GITHUB_OUTPUT
+            echo "cwd=$(dirname $PROJECT)"     >> $GITHUB_OUTPUT
             echo "Found Project.xml: $PROJECT"
           elif [ -n "$HXML" ]; then
-            echo "type=hxml" >> $GITHUB_OUTPUT
-            echo "file=$HXML" >> $GITHUB_OUTPUT
-            echo "cwd=$(dirname $HXML)" >> $GITHUB_OUTPUT
+            echo "type=hxml"                   >> $GITHUB_OUTPUT
+            echo "file=$HXML"                  >> $GITHUB_OUTPUT
+            echo "cwd=$(dirname $HXML)"        >> $GITHUB_OUTPUT
             echo "Found .hxml: $HXML"
           else
             echo "type=none" >> $GITHUB_OUTPUT
-            echo "ERROR: No Project.xml or .hxml found!"
+            echo "ERROR: Project.xml / .hxml 없음"
             find $GITHUB_WORKSPACE/mod_src -type f | head -20
             exit 1
           fi
 
-      - name: Build HTML5 (lime)
-        if: steps.find_project.outputs.type == 'lime'
+      - name: Build
         working-directory: ${{ steps.find_project.outputs.cwd }}
         run: |
+          # 빌드 출력 디렉토리 사전 생성 (권한 오류 방지)
           mkdir -p export/html5/bin export/release/html5/bin export/final/html5/bin
-          haxelib run lime build html5 -final 2>&1
+
+          TYPE="${{ steps.find_project.outputs.type }}"
+          if [ "$TYPE" = "lime" ]; then
+            haxelib run lime build html5 -final 2>&1
+          else
+            haxe "$(basename '${{ steps.find_project.outputs.file }}')" 2>&1
+          fi
           echo "Build exit: $?"
 
-      - name: Build HTML5 (hxml)
-        if: steps.find_project.outputs.type == 'hxml'
-        working-directory: ${{ steps.find_project.outputs.cwd }}
-        run: |
-          haxe "$(basename '${{ steps.find_project.outputs.file }}')"
-
-      - name: Collect build output
+      - name: Collect output
         run: |
           mkdir -p /tmp/build_output
+          CWD="${{ steps.find_project.outputs.cwd }}"
 
-          # lime html5 빌드 결과물 경로 우선순위대로 탐색
           BUILD_SRC=""
           for CANDIDATE in \
-            "$GITHUB_WORKSPACE/mod_src/export/release/html5/bin" \
-            "$GITHUB_WORKSPACE/mod_src/export/html5/bin" \
-            "$GITHUB_WORKSPACE/mod_src/export/final/html5/bin" \
-            "$GITHUB_WORKSPACE/mod_src/export"; do
+            "$CWD/export/release/html5/bin" \
+            "$CWD/export/html5/bin" \
+            "$CWD/export/final/html5/bin" \
+            "$CWD/export"; do
             if [ -f "$CANDIDATE/index.html" ]; then
               BUILD_SRC="$CANDIDATE"
               break
             fi
           done
 
-          # 못 찾으면 전체에서 index.html 탐색 (단, mod_src 루트 제외)
+          # 못 찾으면 전체 탐색
           if [ -z "$BUILD_SRC" ]; then
-            BUILD_SRC=$(find "$GITHUB_WORKSPACE/mod_src" -mindepth 2 -name "index.html" | head -1 | xargs -I{} dirname {} 2>/dev/null || true)
+            BUILD_SRC=$(find "$GITHUB_WORKSPACE/mod_src" -mindepth 2 -name "index.html" \
+              | head -1 | xargs -I{} dirname {} 2>/dev/null || true)
           fi
 
-          if [ -n "$BUILD_SRC" ] && [ "$BUILD_SRC" != "$GITHUB_WORKSPACE/mod_src" ]; then
+          if [ -n "$BUILD_SRC" ] && [ -f "$BUILD_SRC/index.html" ]; then
             rsync -a --no-perms "$BUILD_SRC/" /tmp/build_output/
             echo "수집 완료: $BUILD_SRC"
             ls /tmp/build_output/ | head -10
           else
-            echo "index.html 없음 또는 유효 경로 아님 — 빌드 실패"
+            echo "index.html 없음 — 빌드 실패"
             find "$GITHUB_WORKSPACE/mod_src" -type f \( -name "*.js" -o -name "*.html" \) | head -10
             exit 1
           fi
@@ -200,7 +205,7 @@ jobs:
           path: /tmp/build_output/
           retention-days: 1
 
-      - name: Cleanup GitHub Release (빌드 후 소스 삭제)
+      - name: Cleanup GitHub Release
         if: always()
         run: |
           TAG="fnf-mod-${{ github.event.inputs.mod_id }}"
@@ -209,14 +214,13 @@ jobs:
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || true)
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
           if [ -n "$REL_ID" ]; then
             curl -sf -X DELETE \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               "https://api.github.com/repos/$REPO/releases/$REL_ID" || true
-            echo "Release 삭제: $REL_ID"
           fi
           curl -sf -X DELETE \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/$REPO/git/refs/tags/$TAG" || true
-          echo "Tag 삭제: $TAG"
+          echo "Release/Tag 정리 완료: $TAG"

@@ -114,28 +114,28 @@ jobs:
           if [ -n "$PROJECT_PATH" ]; then
             echo "Project.xml 파싱 중: $PROJECT_PATH"
             python3 - "$PROJECT_PATH" << 'PY'
-import xml.etree.ElementTree as ET, subprocess, sys
-already = {"lime","openfl","flixel","flixel-addons","hxcpp",
-           "tjson","hscript","hxCodec","polymod","actuate","hxp","hxdiscord_rpc"}
-proj = sys.argv[1]
-try:
-    tree = ET.parse(proj)
-    for el in tree.iter():
-        if el.tag == "haxelib":
-            name = el.get("name","").strip()
-            ver  = el.get("version","").strip()
-            if name and name.lower() not in {x.lower() for x in already}:
-                already.add(name)
-                cmd = ["haxelib","install",name,"--quiet"]
-                if ver:
-                    cmd.insert(2, ver)
-                print(f"==> Project.xml 추가 설치: {name} {ver or '(latest)'}")
-                subprocess.run(cmd, check=False)
-                if ver:
-                    subprocess.run(["haxelib","set",name,ver], check=False)
-except Exception as e:
-    print(f"[WARN] Project.xml 파싱 오류: {e}", file=sys.stderr)
-PY
+          import xml.etree.ElementTree as ET, subprocess, sys
+          already = {"lime","openfl","flixel","flixel-addons","hxcpp",
+                     "tjson","hscript","hxCodec","polymod","actuate","hxp","hxdiscord_rpc"}
+          proj = sys.argv[1]
+          try:
+              tree = ET.parse(proj)
+              for el in tree.iter():
+                  if el.tag == "haxelib":
+                      name = el.get("name","").strip()
+                      ver  = el.get("version","").strip()
+                      if name and name.lower() not in {x.lower() for x in already}:
+                          already.add(name)
+                          cmd = ["haxelib","install",name,"--quiet"]
+                          if ver:
+                              cmd.insert(2, ver)
+                          print(f"==> Project.xml 추가 설치: {name} {ver or '(latest)'}")
+                          subprocess.run(cmd, check=False)
+                          if ver:
+                              subprocess.run(["haxelib","set",name,ver], check=False)
+          except Exception as e:
+              print(f"[WARN] Project.xml 파싱 오류: {e}", file=sys.stderr)
+          PY
           fi
 
           haxelib run lime setup 2>/dev/null || true

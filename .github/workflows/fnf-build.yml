@@ -7,8 +7,12 @@ on:
         description: 'Mod UUID'
         required: true
       zip_url:
-        description: 'Source ZIP Download URL (raw.githubusercontent.com 커밋 경로 또는 임의의 공개 HTTPS URL)'
+        description: 'Source ZIP 조각(part_0000.bin ...)들이 있는 base URL (끝에 / 포함, raw.githubusercontent.com)'
         required: true
+      part_count:
+        description: '조각 개수 (20MB 단위로 분할 업로드됨, 기본 1)'
+        required: false
+        default: '1'
       callback_url:
         description: 'Callback URL (unused, kept for compat)'
         required: false
@@ -29,14 +33,27 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y neko
 
-      - name: Download source ZIP
+      - name: Download source ZIP (조각 재조립)
+        # [구조 변경] 브라우저가 20MB 단위로 조각내어 mods/{mod_id}/part_0000.bin ...
+        # 형태로 직접 커밋한다(GitHub API 요청당 실측 한도 30~40MB 회피, 문서상
+        # 100MB지만 실제로는 40MB부터 "too large to process"로 실패함을 확인).
+        # 여기서 조각을 전부 내려받아 순서대로 이어붙인 뒤 압축을 푼다.
         run: |
-          mkdir -p $GITHUB_WORKSPACE/mod_src
-          echo "다운로드 URL: ${{ github.event.inputs.zip_url }}"
-          curl -L --retry 3 --retry-delay 2 --max-time 60 \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "${{ github.event.inputs.zip_url }}" \
-            -o /tmp/source.zip
+          mkdir -p $GITHUB_WORKSPACE/mod_src /tmp/parts
+          BASE_URL="${{ github.event.inputs.zip_url }}"
+          PART_COUNT="${{ github.event.inputs.part_count }}"
+          if [ -z "$PART_COUNT" ]; then PART_COUNT=1; fi
+          echo "베이스 URL: $BASE_URL / 조각 개수: $PART_COUNT"
+          for i in $(seq 0 $((PART_COUNT-1))); do
+            IDX=$(printf "%04d" "$i")
+            echo "다운로드: part_${IDX}.bin"
+            curl -L --retry 3 --retry-delay 2 --max-time 60 \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "${BASE_URL}part_${IDX}.bin" \
+              -o "/tmp/parts/part_${IDX}.bin"
+          done
+          cat /tmp/parts/part_*.bin > /tmp/source.zip
+          rm -f /tmp/parts/*.bin
           ls -lh /tmp/source.zip
           unzip -o /tmp/source.zip -d $GITHUB_WORKSPACE/mod_src
           ITEMS=$(ls $GITHUB_WORKSPACE/mod_src | wc -l)
@@ -72,8 +89,62 @@ jobs:
         run: |
           haxelib setup ~/haxelib
 
+          # [버그 수정] 이전엔 hxdiscord_rpc 등 핵심 라이브러리를 버전 지정 없이
+          # "latest"로 먼저 깔아버린 뒤, Project.xml 전체 파싱 단계에서는 이미
+          # "설치된 이름"으로 취급해 건너뛰었다. 그 결과 모드가 Project.xml에
+          # 예: <haxelib name="hxdiscord_rpc" version="1.2.4" /> 로 특정 버전을
+          # 요구해도 실제로는 latest(1.3.0)만 설치되어 컴파일러가
+          # "Could not find haxelib hxdiscord_rpc version 1.2.4" 오류를 냈다.
+          # 수정: Project.xml에 명시된 haxelib(이름+버전)을 최우선으로 정확히
+          # 설치하고, 그 이후 핵심 라이브러리 기본값은 "아직 설치 안 된 것만" 채운다.
+          PROJECT_PATH=$(find $GITHUB_WORKSPACE/mod_src -name "Project.xml" | head -1 || true)
+          INSTALLED_FROM_PROJECT=""
+          if [ -n "$PROJECT_PATH" ]; then
+            echo "Project.xml 파싱 중(명시된 haxelib 우선 설치): $PROJECT_PATH"
+            python3 - "$PROJECT_PATH" << 'PY'
+          import xml.etree.ElementTree as ET, subprocess, sys
+          proj = sys.argv[1]
+          installed = []
+          try:
+              tree = ET.parse(proj)
+              for el in tree.iter():
+                  if el.tag == "haxelib":
+                      name = el.get("name", "").strip()
+                      ver = el.get("version", "").strip()
+                      if not name:
+                          continue
+                      installed.append(name.lower())
+                      cmd = ["haxelib", "install", name]
+                      if ver:
+                          cmd.append(ver)
+                      cmd.append("--quiet")
+                      print(f"==> Project.xml 명시 설치: {name} {ver or '(latest)'}")
+                      subprocess.run(cmd, check=False)
+                      if ver:
+                          subprocess.run(["haxelib", "set", name, ver], check=False)
+              with open("/tmp/installed_from_project.txt", "w") as f:
+                  f.write(" ".join(installed))
+          except Exception as e:
+              print(f"[WARN] Project.xml 파싱 오류: {e}", file=sys.stderr)
+          PY
+            INSTALLED_FROM_PROJECT=$(cat /tmp/installed_from_project.txt 2>/dev/null || true)
+          fi
+          echo "Project.xml에서 이미 설치된 라이브러리: $INSTALLED_FROM_PROJECT"
+
+          is_installed() {
+            case " $INSTALLED_FROM_PROJECT " in
+              *" $1 "*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
           install_lib() {
             LIB=$1; VER=$2
+            LOWER=$(echo "$LIB" | tr '[:upper:]' '[:lower:]')
+            if is_installed "$LOWER"; then
+              echo "==> $LIB 은 Project.xml에서 이미 설치됨 (건너뜀)"
+              return
+            fi
             if [ -n "$VER" ]; then
               echo "==> $LIB $VER 설치"
               haxelib install "$LIB" "$VER" --quiet 2>&1 | grep -v "^[0-9]" || true
@@ -94,49 +165,13 @@ jobs:
             install_lib hxcpp ""
           fi
 
-          # 핵심 라이브러리 고정 설치 (버전 명시 — 의존성 누락 방지)
+          # 핵심 라이브러리 기본값 — Project.xml에 명시가 없을 때만 채워넣는다
           CORE_LIBS="tjson:1.4.0 hscript: hxCodec: polymod: actuate: hxp: hxdiscord_rpc:"
           for ENTRY in $CORE_LIBS; do
             LIB="${ENTRY%%:*}"
             VER="${ENTRY##*:}"
-            if [ -n "$VER" ]; then
-              echo "==> 핵심 라이브러리: $LIB $VER"
-              haxelib install "$LIB" "$VER" --quiet 2>&1 | grep -v "^[0-9]" || true
-              haxelib set "$LIB" "$VER" 2>/dev/null || true
-            else
-              echo "==> 핵심 라이브러리: $LIB (latest)"
-              haxelib install "$LIB" --quiet 2>&1 | grep -v "^[0-9]" || true
-            fi
+            install_lib "$LIB" "$VER"
           done
-
-          # Project.xml 전체 파싱 → 추가 haxelib 자동 설치
-          PROJECT_PATH=$(find $GITHUB_WORKSPACE/mod_src -name "Project.xml" | head -1 || true)
-          if [ -n "$PROJECT_PATH" ]; then
-            echo "Project.xml 파싱 중: $PROJECT_PATH"
-            python3 - "$PROJECT_PATH" << 'PY'
-          import xml.etree.ElementTree as ET, subprocess, sys
-          already = {"lime","openfl","flixel","flixel-addons","hxcpp",
-                     "tjson","hscript","hxCodec","polymod","actuate","hxp","hxdiscord_rpc"}
-          proj = sys.argv[1]
-          try:
-              tree = ET.parse(proj)
-              for el in tree.iter():
-                  if el.tag == "haxelib":
-                      name = el.get("name","").strip()
-                      ver  = el.get("version","").strip()
-                      if name and name.lower() not in {x.lower() for x in already}:
-                          already.add(name)
-                          cmd = ["haxelib","install",name,"--quiet"]
-                          if ver:
-                              cmd.insert(2, ver)
-                          print(f"==> Project.xml 추가 설치: {name} {ver or '(latest)'}")
-                          subprocess.run(cmd, check=False)
-                          if ver:
-                              subprocess.run(["haxelib","set",name,ver], check=False)
-          except Exception as e:
-              print(f"[WARN] Project.xml 파싱 오류: {e}", file=sys.stderr)
-          PY
-          fi
 
           haxelib run lime setup 2>/dev/null || true
           echo "=== 설치된 haxelibs ==="
@@ -217,28 +252,32 @@ jobs:
           path: /tmp/build_output/
           retention-days: 1
 
-      - name: Cleanup 커밋된 mod ZIP (빌드 후 소스 삭제)
-        # [구조 변경] 브라우저가 GitHub Release 대신 Contents API로 저장소에
-        # 직접 커밋(mods/{mod_id}.zip)하는 방식으로 바뀌었으므로, 정리 로직도
-        # Release/Tag 삭제 대신 해당 파일을 커밋으로 삭제하는 방식으로 변경.
+      - name: Cleanup 커밋된 mod 조각들 (빌드 후 소스 삭제)
+        # [구조 변경] 브라우저가 mods/{mod_id}/part_0000.bin ... 형태로 여러
+        # 조각을 직접 커밋하므로, 정리 로직도 조각 개수만큼 반복해서 지운다.
         if: always()
         run: |
           REPO="${{ github.repository }}"
           MOD_ID="${{ github.event.inputs.mod_id }}"
-          PATH_IN_REPO="mods/${MOD_ID}.zip"
-          SHA=$(curl -sf \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/contents/$PATH_IN_REPO?ref=main" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sha',''))" 2>/dev/null || true)
-          if [ -n "$SHA" ]; then
-            curl -sf -X DELETE \
+          PART_COUNT="${{ github.event.inputs.part_count }}"
+          if [ -z "$PART_COUNT" ]; then PART_COUNT=1; fi
+          for i in $(seq 0 $((PART_COUNT-1))); do
+            IDX=$(printf "%04d" "$i")
+            PATH_IN_REPO="mods/${MOD_ID}/part_${IDX}.bin"
+            SHA=$(curl -sf \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github+json" \
-              -H "Content-Type: application/json" \
-              -d "{\"message\":\"cleanup mod ${MOD_ID}\",\"sha\":\"${SHA}\",\"branch\":\"main\"}" \
-              "https://api.github.com/repos/$REPO/contents/$PATH_IN_REPO" || true
-            echo "mod ZIP 삭제: $PATH_IN_REPO"
-          else
-            echo "삭제할 mod ZIP을 찾지 못함 (이미 삭제됐거나 sha 조회 실패): $PATH_IN_REPO"
-          fi
+              "https://api.github.com/repos/$REPO/contents/$PATH_IN_REPO?ref=main" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sha',''))" 2>/dev/null || true)
+            if [ -n "$SHA" ]; then
+              curl -sf -X DELETE \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" \
+                -d "{\"message\":\"cleanup mod ${MOD_ID} part ${IDX}\",\"sha\":\"${SHA}\",\"branch\":\"main\"}" \
+                "https://api.github.com/repos/$REPO/contents/$PATH_IN_REPO" || true
+              echo "삭제: $PATH_IN_REPO"
+            else
+              echo "삭제할 조각을 찾지 못함 (이미 삭제됐거나 sha 조회 실패): $PATH_IN_REPO"
+            fi
+          done

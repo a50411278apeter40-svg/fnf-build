@@ -347,6 +347,146 @@ def apply_unless_html5(xml_content, define_name):
     return DEFINE_TAG_RE.sub(_sub, xml_content, count=0)
 
 
+# ── C) source/import.hx 패치 (진짜 근본 원인) ─────────────────────────────
+# Psych Engine은 source/import.hx 에서
+#   #if sys
+#   import sys.*;
+#   import sys.io.*;
+#   #elseif js
+#   import js.html.*;
+#   #end
+# 를 통해 "모든 .hx 파일에 자동으로" File/FileSystem 등을 주입한다.
+# 문제는 html5(js)에서 import js.html.*; 가 켜지는데, 브라우저 DOM에는
+# 우리가 원하는 것과 이름만 같은 완전히 다른 클래스들이 있다는 것:
+#   - js.html.File / js.html.FileSystem : getContent/exists 같은 메서드가
+#     전혀 없는 DOM 전용 클래스라서 "has no field X" 에러가 프로젝트 전체
+#     (Paths.hx, Mods.hx, ChartingState.hx, ... 15개 이상 파일)에서 발생.
+#   - js.html.Option : 브라우저 <select> 옵션 생성자로 new Option(text,
+#     value, defaultSelected:Bool, selected) 시그니처를 가지는데, 이게
+#     Psych 자신의 options.Option 클래스(같은 패키지라 원래는 암묵적으로
+#     보여야 함)를 가려버려서 'String should be Bool' 에러가 남.
+# 해결: html5일 때는 js.html.* 와일드카드를 우리 compat 패키지로 바꿔서
+# 이 충돌들을 원천 차단한다. (sys/기타 js 타겟은 기존 동작 그대로 유지)
+IMPORT_HX_OLD_BLOCK = re.compile(
+    r'#if\s+sys\s*\n'
+    r'import\s+sys\.\*;\s*\n'
+    r'import\s+sys\.io\.\*;\s*\n'
+    r'#elseif\s+js\s*\n'
+    r'import\s+js\.html\.\*;\s*\n'
+    r'#end'
+)
+
+
+def patch_import_hx(project_dir):
+    for root, _dirs, files in os.walk(project_dir):
+        if 'import.hx' not in files:
+            continue
+        path = os.path.join(root, 'import.hx')
+        with open(path, encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        if 'backend.__html5compat' in content:
+            print(f'[import.hx] 이미 패치되어 있음 — 건너뜀: {path}')
+            continue
+
+        m = IMPORT_HX_OLD_BLOCK.search(content)
+        if not m:
+            continue
+
+        replacement = (
+            '#if sys\n'
+            'import sys.*;\n'
+            'import sys.io.*;\n'
+            '#elseif html5\n'
+            f'import {COMPAT_PACKAGE}.*;\n'
+            'import haxe.io.Path;\n'
+            '#elseif js\n'
+            'import js.html.*;\n'
+            '#end'
+        )
+        new_content = content[:m.start()] + replacement + content[m.end():]
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        print(f'[import.hx] 패치 완료 (html5용 js.html.* 와일드카드를 compat 패키지로 교체): {path}')
+        return True
+    return False
+
+
+# ── D) 개별 sys 전용 API 호출 지점 패치 (Sys.sleep/getCwd, cpp.vm.Gc, FlxG.error) ─
+# Sys.* 클래스는 js(html5) 타겟에는 존재하지 않는다(시스템 플랫폼
+# 전용). 메서드마다 반환형이 달라서 html5 대체값도 다르게 줘야 한다
+# (Void면 null도 되지만, Float/String/Int를 non-nullable 변수에 대입하는
+# 코드가 있으면 null은 컴파일 에러가 남 -> 타입에 맞는 기본값 사용).
+SYS_METHOD_FALLBACKS = {
+    'sleep': 'null',
+    'println': 'null',
+    'print': 'null',
+    'setCwd': 'null',
+    'putEnv': 'null',
+    'exit': 'null',
+    'command': '0',
+    'getCwd': '""',
+    'programPath': '""',
+    'time': '0.0',
+    'cpuTime': '0.0',
+    'environment': 'new Map()',
+    'args': '[]',
+}
+SYS_CALL_RE = re.compile(r'Sys\.(\w+)\(([^()]*)\)')
+CPP_GC_RE = re.compile(r'cpp\.vm\.Gc\.memInfo64\(cpp\.vm\.Gc\.MEM_INFO_USAGE\)')
+FLXG_ERROR_RE = re.compile(r'FlxG\.error\(')
+
+
+def patch_misc_sys_calls(project_dir):
+    """
+    Sys.* 계열(sleep/getCwd/time/println/...), cpp.vm.Gc, FlxG.error 를
+    인라인 표현식으로 감싼다(줄 전체가 아니라 호출 부분만 - 'else
+    Sys.sleep(0.001);' 처럼 다른 코드와 같은 줄에 있는 경우가 많아서
+    줄 단위 앵커링은 놓치는 경우가 있었음).
+    """
+    patched = []
+    unknown_methods = set()
+
+    def _sys_replace(m):
+        method, args = m.group(1), m.group(2)
+        fallback = SYS_METHOD_FALLBACKS.get(method)
+        if fallback is None:
+            unknown_methods.add(method)
+            fallback = 'null'  # 모르는 메서드는 일단 null로 안전하게 처리
+        return f'(#if !html5 Sys.{method}({args}) #else {fallback} #end)'
+
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d != '__html5_compat_src']
+        for fn in files:
+            if not fn.endswith('.hx'):
+                continue
+            fpath = os.path.join(root, fn)
+            try:
+                with open(fpath, encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            original = content
+
+            content = SYS_CALL_RE.sub(_sys_replace, content)
+            content = CPP_GC_RE.sub('(#if cpp cpp.vm.Gc.memInfo64(cpp.vm.Gc.MEM_INFO_USAGE) #else 0.0 #end)', content)
+            content = FLXG_ERROR_RE.sub('trace(', content)
+
+            if content != original:
+                with open(fpath, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                patched.append(fpath)
+
+    if patched:
+        print(f'[개별 API] Sys.*, cpp.vm.Gc, FlxG.error 패치된 파일 {len(patched)}개')
+        for f in patched:
+            print(f'  - {f}')
+    if unknown_methods:
+        print(f'[WARN] 반환형을 모르는 Sys.* 메서드 발견 (null로 대체함, 타입 에러 나면 SYS_METHOD_FALLBACKS에 추가 필요): {sorted(unknown_methods)}')
+    return len(patched) > 0
+
+
 def main():
     if len(sys.argv) < 2:
         print('사용법: patch_html5_threads.py <Project.xml 경로>')
@@ -356,6 +496,8 @@ def main():
     project_dir = os.path.dirname(os.path.abspath(project_xml))
 
     needs_compat_source_path = patch_sys_apis(project_dir)
+    patch_import_hx(project_dir)
+    patch_misc_sys_calls(project_dir)
 
     with open(project_xml, encoding='utf-8') as f:
         xml_content = f.read()

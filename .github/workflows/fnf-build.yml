@@ -104,7 +104,7 @@ jobs:
             exit 0
           fi
 
-          echo "Project.xml 없음 → 모드 전용(에셋만) 업로드로 판단"
+          echo "Project.xml 없음 → 모드 전용 업로드로 판단"
           echo "업로드된 모드 콘텐츠 최상위 목록:"
           ls "$GITHUB_WORKSPACE/mod_src"
 
@@ -121,7 +121,6 @@ jobs:
             find "$GITHUB_WORKSPACE/base_engine" -maxdepth 1
             exit 1
           fi
-          mkdir -p "$GITHUB_WORKSPACE/base_engine/assets"
 
           # mods/<이름>/ 처럼 한 겹 더 감싸져 있어서 카테고리 폴더가
           # mod_src 바로 아래에 안 보이는 경우, 폴더가 하나뿐이면 그 안으로
@@ -140,15 +139,75 @@ jobs:
             fi
           fi
 
-          echo "다음 경로를 base_engine/assets/ 위에 덮어씌움: $MERGE_SRC"
-          rsync -a --no-perms "$MERGE_SRC/" "$GITHUB_WORKSPACE/base_engine/assets/"
+          # [수정] assets/ 에 덮어쓰지 않고, Psych Engine 고유의 모드
+          # 시스템(Polymod) 구조 그대로 mods/<모드이름>/ 폴더에 넣는다.
+          MOD_NAME="mod_${{ github.event.inputs.mod_id }}"
+          MOD_DEST="$GITHUB_WORKSPACE/base_engine/mods/${MOD_NAME}"
+          mkdir -p "$MOD_DEST"
+          echo "다음 경로를 mods/${MOD_NAME}/ 에 그대로 복사: $MERGE_SRC"
+          rsync -a --no-perms "$MERGE_SRC/" "$MOD_DEST/"
+
+          # --- html5에서도 이 mods 폴더가 실제로 로드되게 하기 위한 3가지 필수 패치 ---
+          # Psych Engine의 모드 시스템(Paths.mods*, Mods.hx)은 전부
+          # `#if MODS_ALLOWED` 로 게이트되어 있고, Project.xml은 기본값으로
+          # MODS_ALLOWED를 if="desktop" 으로 데스크톱 전용 처리한다(브라우저는
+          # 원래 로컬 mods 폴더를 런타임에 읽을 수 없다는 전제). 그래서:
+          #   1) MODS_ALLOWED를 모든 타겟(html5 포함)에서 항상 켜지도록 강제.
+          #   2) mods 폴더 자체를 html5 빌드에도 실제로 embed(내장)시킴
+          #      (desktop은 원래 파일로 복사되지만 브라우저는 파일시스템이
+          #      없으므로 컴파일 시점에 통째로 구워넣어야만 한다).
+          #   3) Mods.currentModDirectory 기본값을 우리가 만든 모드 폴더
+          #      이름으로 고정 — 별도의 "모드 활성화 메뉴" 없이도 이 mods
+          #      폴더가 항상 활성 모드로 취급되게 한다.
+          # 남은 sys.FileSystem/sys.io.File 컴파일 에러는 바로 다음 단계인
+          # "Patch sys.thread.* for html5 compatibility"에서 항상 처리되고,
+          # 그 대체 클래스는 이제 openfl.utils.Assets로 실제 embed된 파일을
+          # 찾아 읽어오도록 개선되어 있어 mods 폴더 내용이 실제로 반영된다.
+          PROJECT_XML="$GITHUB_WORKSPACE/base_engine/Project.xml"
+          python3 - "$PROJECT_XML" "$MOD_NAME" << 'PY'
+          import re, sys
+          path, mod_name = sys.argv[1], sys.argv[2]
+          xml = open(path, encoding='utf-8').read()
+
+          # 1) MODS_ALLOWED를 모든 타겟에서 항상 켜기
+          xml = xml.replace(
+              '<define name="MODS_ALLOWED" if="desktop" />',
+              '<define name="MODS_ALLOWED" />'
+          )
+
+          # 2) mods 폴더 + modsList.txt를 html5에도 embed 시키기
+          #    (기존 <section if="MODS_ALLOWED"> 안의 desktop용 template
+          #     복사 항목들은 그대로 두고, html5 전용 embed 라인을 추가)
+          anchor = "<section if=\"MODS_ALLOWED\">"
+          if anchor in xml and 'path="mods" embed="true" if="html5"' not in xml:
+              xml = xml.replace(
+                  anchor,
+                  anchor + "\n\t\t<assets path='mods' embed='true' if=\"html5\"/>",
+                  1
+              )
+
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(xml)
+          print("Project.xml 패치 완료: MODS_ALLOWED 상시 활성화 + mods/ html5 embed 추가")
+          PY
+
+          # 3) Mods.currentModDirectory 기본값을 우리 모드 폴더 이름으로 고정
+          MODS_HX=$(find "$GITHUB_WORKSPACE/base_engine/source" -iname "Mods.hx" | head -1 || true)
+          if [ -n "$MODS_HX" ]; then
+            sed -i "s/currentModDirectory:String = '';/currentModDirectory:String = '${MOD_NAME}';/" "$MODS_HX"
+            grep -n "currentModDirectory:String" "$MODS_HX" || true
+          else
+            echo "WARN: Mods.hx를 못 찾음 — currentModDirectory 기본값 패치 스킵"
+          fi
 
           echo "병합 완료 - mod_src를 병합된 베이스 엔진으로 교체"
-          rm -rf "$GITHUB_WORKSPACE/mod_src"
+          python3 -c "import shutil; shutil.rmtree('$GITHUB_WORKSPACE/mod_src')"
           mv "$GITHUB_WORKSPACE/base_engine" "$GITHUB_WORKSPACE/mod_src"
 
           echo "최종 mod_src 최상위 목록:"
           ls "$GITHUB_WORKSPACE/mod_src" | head -20
+          echo "mods/${MOD_NAME}/ 내용:"
+          ls "$GITHUB_WORKSPACE/mod_src/mods/${MOD_NAME}" | head -20
 
       - name: Detect required haxelib versions from Project.xml
         id: detect_versions

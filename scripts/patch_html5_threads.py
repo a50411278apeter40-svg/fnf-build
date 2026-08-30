@@ -136,30 +136,49 @@ class Tls<T> {{
 ''',
     ("sys.io", "File"): f'''package {COMPAT_PACKAGE};
 
+import openfl.utils.Assets;
+
 /**
  * html5(JS)는 로컬 파일시스템에 직접 접근할 수 없다. sys.io.File을 그대로
- * 쓰면 컴파일 자체가 막히므로, 조용히 아무 동작도 하지 않는 대체 클래스로
- * 치환한다 — 채보 에디터처럼 데스크톱 전용 보조 기능만 웹에서 비활성화
- * 되고, 나머지 게임 로직은 정상적으로 빌드/실행된다.
+ * 쓰면 컴파일 자체가 막히므로 대체 클래스로 치환한다.
+ * [개선] 단순히 빈 값만 돌려주면 mods/ 폴더처럼 빌드 타임에 실제로
+ * embed된 파일을 읽어야 하는 코드가 전부 죽는다. 그래서 무조건 빈 값이
+ * 아니라, 먼저 openfl.utils.Assets(빌드 시 embed=true로 묶여 들어간
+ * 에셋 매니페스트)에서 동일 경로를 찾아보고, 있으면 그 내용을 돌려준다.
+ * 없으면(진짜 로컬 파일시스템 전용 기능, 예: 채보 에디터 저장) 조용히
+ * 빈 값으로 무시한다.
  */
 class File {{
 \tpublic static function getContent(path:String):String {{
-\t\ttrace('[html5] File.getContent 은 브라우저에서 지원되지 않습니다: ' + path);
+\t\tif (Assets.exists(path)) return Assets.getText(path);
+\t\ttrace('[html5] File.getContent: embed된 에셋에서 못 찾음 - ' + path);
 \t\treturn '';
 \t}}
 \tpublic static function saveContent(path:String, content:String):Void {{
 \t\ttrace('[html5] File.saveContent 은 브라우저에서 지원되지 않습니다: ' + path);
 \t}}
 \tpublic static function getBytes(path:String):haxe.io.Bytes {{
+\t\tif (Assets.exists(path)) return Assets.getBytes(path);
 \t\treturn haxe.io.Bytes.alloc(0);
 \t}}
 }}
 ''',
     ("sys", "FileSystem"): f'''package {COMPAT_PACKAGE};
 
-/** html5는 로컬 파일시스템이 없으므로 항상 "없음"으로 응답하는 대체. */
+import openfl.utils.Assets;
+
+/**
+ * [개선] html5는 진짜 로컬 파일시스템이 없다. 하지만 mods/ 폴더 등을
+ * embed=true 로 빌드에 구워넣은 경우, 그 경로들은 openfl.utils.Assets
+ * 매니페스트에 들어있다. exists()는 무조건 false 대신 Assets.exists로
+ * 먼저 확인해서, embed된 mods 파일이면 "존재함"으로 정확히 응답한다.
+ * isDirectory/readDirectory는 브라우저에 진짜 디렉토리 개념이 없어
+ * 정확히 구현할 수 없으므로 보수적으로 false/빈 배열을 유지한다 —
+ * 실제로 쓰이는 경로는 특정 "파일" 하나의 존재 여부(exists)만 물어보는
+ * 패턴(Paths.hx의 modFolders 등)이라 이거면 충분하다.
+ */
 class FileSystem {{
-\tpublic static function exists(path:String):Bool {{ return false; }}
+\tpublic static function exists(path:String):Bool {{ return Assets.exists(path); }}
 \tpublic static function isDirectory(path:String):Bool {{ return false; }}
 \tpublic static function readDirectory(path:String):Array<String> {{ return []; }}
 \tpublic static function createDirectory(path:String):Void {{}}

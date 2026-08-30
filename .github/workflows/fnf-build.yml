@@ -56,14 +56,99 @@ jobs:
           rm -f /tmp/parts/*.bin
           ls -lh /tmp/source.zip
           unzip -o /tmp/source.zip -d $GITHUB_WORKSPACE/mod_src
-          ITEMS=$(ls $GITHUB_WORKSPACE/mod_src | wc -l)
-          FIRST=$(ls $GITHUB_WORKSPACE/mod_src | head -1)
-          if [ "$ITEMS" = "1" ] && [ -d "$GITHUB_WORKSPACE/mod_src/$FIRST" ]; then
-            mv "$GITHUB_WORKSPACE/mod_src/$FIRST/"* "$GITHUB_WORKSPACE/mod_src/" 2>/dev/null || true
-            rmdir "$GITHUB_WORKSPACE/mod_src/$FIRST" 2>/dev/null || true
-          fi
+          # 여러 겹으로 감싸진 폴더(zip 안에 폴더 하나만 있고 그 안에 또
+          # 폴더 하나만 있는 경우 등)를 최대 3단계까지 반복해서 벗겨낸다.
+          for _u in 1 2 3; do
+            ITEMS=$(ls "$GITHUB_WORKSPACE/mod_src" | wc -l)
+            FIRST=$(ls "$GITHUB_WORKSPACE/mod_src" | head -1)
+            if [ "$ITEMS" = "1" ] && [ -d "$GITHUB_WORKSPACE/mod_src/$FIRST" ]; then
+              mv "$GITHUB_WORKSPACE/mod_src/$FIRST"/* "$GITHUB_WORKSPACE/mod_src/" 2>/dev/null || true
+              mv "$GITHUB_WORKSPACE/mod_src/$FIRST"/.[!.]* "$GITHUB_WORKSPACE/mod_src/" 2>/dev/null || true
+              rmdir "$GITHUB_WORKSPACE/mod_src/$FIRST" 2>/dev/null || true
+            else
+              break
+            fi
+          done
           echo "소스 파일 목록:"
           ls $GITHUB_WORKSPACE/mod_src | head -15
+
+      - name: 모드 전용 업로드 감지 및 베이스 엔진 병합
+        # [기능 추가] 이제부터 사용자는 (A) 전체 Psych Engine 소스가 포함된
+        # zip 이나 (B) 엔진 없이 모드 콘텐츠만(Polymod의 mods/<이름>/ 폴더와
+        # 동일한 구조: data/, images/, songs/, sounds/, video/, music/,
+        # characters/ 등) 담긴 zip 중 무엇을 올려도 자동으로 감지해서
+        # 컴파일한다.
+        #
+        # 감지 방법: 압축 해제된 mod_src 안 어디에도 Project.xml이 없으면
+        # "모드 전용" 업로드로 판단한다. 이 경우 공식 Psych Engine
+        # (ShadowMario/FNF-PsychEngine, main 브랜치)을 tarball로 받아
+        # 베이스 엔진으로 쓰고, 업로드된 모드 콘텐츠를 그 엔진의 assets/
+        # 폴더 위에 그대로 덮어씌운다(overlay merge).
+        #
+        # 이렇게 하는 이유: Polymod의 mods/<이름>/ 폴더 구조는 assets/
+        # 폴더 트리를 그대로 미러링하기 때문에 이 매핑이 정확히
+        # 맞아떨어진다. 게다가 html5는 MODS_ALLOWED(런타임 Polymod 로딩)가
+        # Project.xml에서 if="desktop"으로 막혀 있어 브라우저에서는 mods
+        # 폴더를 동적으로 읽을 수 없다 — 즉 "빌드 타임에 assets에 미리
+        # 합쳐 넣는" 이 방식이 html5에서 모드를 실제로 반영시키는 유일한
+        # 길이다. git clone 대신 tarball 다운로드를 쓰는 이유는 이 엔진
+        # 리포지토리 사이즈가 커서(1GB+) .git 히스토리까지 받는 git
+        # clone보다 압축된 tarball 단일 다운로드가 훨씬 빠르기 때문.
+        #
+        # Project.xml이 이미 있으면(전체 엔진 업로드) 이 단계는 아무것도
+        # 하지 않고 기존 방식 그대로 진행한다 — 기존 동작 100% 유지.
+        run: |
+          PROJECT=$(find "$GITHUB_WORKSPACE/mod_src" -iname "Project.xml" | head -1 || true)
+          if [ -n "$PROJECT" ]; then
+            echo "Project.xml 발견 → 전체 엔진 업로드로 판단, 병합 단계 스킵"
+            exit 0
+          fi
+
+          echo "Project.xml 없음 → 모드 전용(에셋만) 업로드로 판단"
+          echo "업로드된 모드 콘텐츠 최상위 목록:"
+          ls "$GITHUB_WORKSPACE/mod_src"
+
+          echo "베이스 엔진(ShadowMario/FNF-PsychEngine main) tarball 다운로드 중..."
+          mkdir -p "$GITHUB_WORKSPACE/base_engine"
+          curl -L --retry 3 --retry-delay 2 --max-time 300 \
+            -o /tmp/psych_base.tar.gz \
+            "https://github.com/ShadowMario/FNF-PsychEngine/archive/refs/heads/main.tar.gz"
+          tar -xzf /tmp/psych_base.tar.gz -C "$GITHUB_WORKSPACE/base_engine" --strip-components=1
+          rm -f /tmp/psych_base.tar.gz
+
+          if [ ! -f "$GITHUB_WORKSPACE/base_engine/Project.xml" ]; then
+            echo "ERROR: 베이스 엔진 다운로드/해제 실패 (Project.xml 없음)"
+            find "$GITHUB_WORKSPACE/base_engine" -maxdepth 1
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/base_engine/assets"
+
+          # mods/<이름>/ 처럼 한 겹 더 감싸져 있어서 카테고리 폴더가
+          # mod_src 바로 아래에 안 보이는 경우, 폴더가 하나뿐이면 그 안으로
+          # 한 번 더 들어가서 실제 콘텐츠를 찾는다.
+          MERGE_SRC="$GITHUB_WORKSPACE/mod_src"
+          HAS_CATEGORY=$(find "$MERGE_SRC" -maxdepth 1 -type d \
+            \( -iname "data" -o -iname "images" -o -iname "songs" -o -iname "sounds" \
+               -o -iname "video" -o -iname "music" -o -iname "characters" -o -iname "shared" \
+               -o -iname "preload" -o -iname "weeks" -o -iname "fonts" \) | head -1 || true)
+          if [ -z "$HAS_CATEGORY" ]; then
+            ONLY_DIR=$(ls "$MERGE_SRC" | head -1)
+            ITEM_COUNT=$(ls "$MERGE_SRC" | wc -l)
+            if [ "$ITEM_COUNT" = "1" ] && [ -d "$MERGE_SRC/$ONLY_DIR" ]; then
+              echo "카테고리 폴더가 안 보여서 한 단계 더 내려감: $ONLY_DIR/"
+              MERGE_SRC="$MERGE_SRC/$ONLY_DIR"
+            fi
+          fi
+
+          echo "다음 경로를 base_engine/assets/ 위에 덮어씌움: $MERGE_SRC"
+          rsync -a --no-perms "$MERGE_SRC/" "$GITHUB_WORKSPACE/base_engine/assets/"
+
+          echo "병합 완료 - mod_src를 병합된 베이스 엔진으로 교체"
+          rm -rf "$GITHUB_WORKSPACE/mod_src"
+          mv "$GITHUB_WORKSPACE/base_engine" "$GITHUB_WORKSPACE/mod_src"
+
+          echo "최종 mod_src 최상위 목록:"
+          ls "$GITHUB_WORKSPACE/mod_src" | head -20
 
       - name: Detect required haxelib versions from Project.xml
         id: detect_versions

@@ -199,6 +199,45 @@ jobs:
             exit 1
           fi
 
+      - name: Patch Project.xml for html5 thread-safety
+        if: steps.find_project.outputs.type == 'lime'
+        run: |
+          # [버그 수정] 최신 Psych Engine 기본 Project.xml은
+          # <define name="MULTITHREADED_LOADING" /> 를 if="desktop" 같은
+          # 조건 없이 "무조건" 켜놓고 배포한다. 이 define이 활성화되면
+          # 엔진 내부에서 sys.thread.FixedThreadPool을 사용하는데, html5는
+          # 스레드를 지원하지 않아 "This class is not available on this
+          # target" 컴파일 에러로 100% 실패한다. -D HXCPP_NO_THREADS 는
+          # 이 define 자체를 끄지 못해서(다른 define이라) 효과가 없었음.
+          #
+          # 업로드된 모드의 Project.xml을 신뢰할 수 없으므로, 빌드 직전에
+          # lime이 지원하는 <undefine> 태그를 </project> 바로 앞에 강제
+          # 삽입해 html5 타겟에서는 항상 MULTITHREADED_LOADING을
+          # 무효화시킨다. (문서 순서상 나중에 오는 태그가 우선 적용됨)
+          PROJECT="${{ steps.find_project.outputs.file }}"
+          python3 - "$PROJECT" << 'PY_PATCH'
+          import sys
+          path = sys.argv[1]
+          with open(path, encoding='utf-8') as f:
+              content = f.read()
+          patch = (
+              '\n\t<!-- [서버 자동 패치] html5는 스레드를 지원하지 않아 '
+              'MULTITHREADED_LOADING을 강제로 무효화 -->\n'
+              '\t<undefine name="MULTITHREADED_LOADING" if="html5" />\n'
+          )
+          if '<undefine name="MULTITHREADED_LOADING"' in content:
+              print('이미 undefine 처리되어 있음 — 건너뜀')
+          elif '</project>' in content:
+              content = content.replace('</project>', patch + '</project>')
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content)
+              print(f'패치 완료: {path}')
+          else:
+              print(f'[WARN] </project> 태그를 찾지 못함: {path}')
+          PY_PATCH
+          echo "=== 패치 후 관련 라인 ==="
+          grep -n -i "MULTITHREADED_LOADING" "$PROJECT" || true
+
       - name: Build HTML5 (lime)
         if: steps.find_project.outputs.type == 'lime'
         working-directory: ${{ steps.find_project.outputs.cwd }}

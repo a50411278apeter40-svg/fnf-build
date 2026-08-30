@@ -204,14 +204,22 @@ jobs:
         working-directory: ${{ steps.find_project.outputs.cwd }}
         run: |
           mkdir -p export/html5/bin export/release/html5/bin export/final/html5/bin
-          haxelib run lime build html5 -final 2>&1
+          # [버그 수정] Psych Engine류 모드의 Project.xml이 데스크톱 전용
+          # MULTITHREADED_LOADING(sys.thread.FixedThreadPool 사용) define을
+          # html5에서 제대로 배제하지 못하면 컴파일러가
+          # "sys/thread/FixedThreadPool.hx: This class is not available on
+          # this target" 오류로 실패한다(HTML5는 스레드 자체를 지원하지 않음).
+          # 업로드되는 모드마다 Project.xml 내용을 신뢰할 수 없으므로,
+          # 서버(CI) 단에서 항상 -D HXCPP_NO_THREADS를 강제로 넘겨
+          # 스레드풀 경로를 원천적으로 비활성화한다.
+          haxelib run lime build html5 -final -D HXCPP_NO_THREADS 2>&1
           echo "Build exit: $?"
 
       - name: Build HTML5 (hxml)
         if: steps.find_project.outputs.type == 'hxml'
         working-directory: ${{ steps.find_project.outputs.cwd }}
         run: |
-          haxe "$(basename '${{ steps.find_project.outputs.file }}')"
+          haxe "$(basename '${{ steps.find_project.outputs.file }}')" -D HXCPP_NO_THREADS
 
       - name: Collect build output
         run: |

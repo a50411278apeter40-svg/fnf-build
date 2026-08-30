@@ -218,6 +218,23 @@ def patch_hx_file(path, used_classes):
 
 
 def patch_sys_apis(project_dir):
+    """
+    두 가지 일을 한다:
+    1) 개별 파일에 "명시적으로" 있는 sys.thread.*/sys.io.*/sys.FileSystem
+       import문을 #if !html5 로 감싸서 desktop/html5 분기시킨다.
+       (예: FileDialogHandler.hx가 실제로 'import sys.io.File;' 을 갖고
+       있는 경우 — 이건 그대로 두면 html5에서 'cannot access sys package'
+       컴파일 에러가 난다.)
+    2) [중요] compat 클래스(File/FileSystem/FixedThreadPool/...)는 위의
+       "명시적 import를 찾은 경우"에만 만들면 안 된다 — 실제로는 대부분의
+       파일(Mods.hx, ChartingState.hx, Paths.hx 등)이 명시적 import 없이
+       source/import.hx의 전역 와일드카드(import sys.*; import sys.io.*;)
+       를 통해서만 FileSystem/File 을 쓰고 있었다. 그래서 "명시적으로 찾은
+       것만" 생성하면 FileSystem.hx 자체가 안 만들어져서 'Type not found:
+       FileSystem' 에러가 났다. → compat 클래스는 항상 전체(COMPAT_CLASSES
+       전부)를 만들어서, import.hx의 와일드카드(#elseif html5 import
+       backend.__html5compat.*;)가 무엇을 요구하든 다 커버되게 한다.
+    """
     used_classes = set()
     patched_files = []
 
@@ -232,24 +249,25 @@ def patch_sys_apis(project_dir):
                 except Exception as e:
                     print(f'[WARN] {fpath} 패치 중 오류(건너뜀): {e}')
 
-    if not used_classes:
-        print('sys.thread/io/FileSystem 무조건 import 패턴 없음 — 패치 불필요')
-        return False
+    if patched_files:
+        print(f'[sys.* 명시적 import] 파일별 #if !html5 분기 패치: {len(patched_files)}개')
+        for f in patched_files:
+            print(f'  - {f}')
+    else:
+        print('[sys.* 명시적 import] 개별 파일에 조건 없는 import문은 없음 (import.hx 와일드카드만 사용 중)')
 
-    print(f'[sys.*] 패치된 파일 {len(patched_files)}개, 대체 클래스: '
-          f'{sorted(cls for _, cls in used_classes)}')
-    for f in patched_files:
-        print(f'  - {f}')
-
+    # compat 클래스는 항상 전체 생성 — import.hx 와일드카드가 뭘 요구할지
+    # 모르므로 부분 생성하면 위와 같은 'Type not found' 재발 위험이 있음.
     compat_root = os.path.join(project_dir, '__html5_compat_src',
                                 *COMPAT_PACKAGE.split('.'))
     os.makedirs(compat_root, exist_ok=True)
-    for key in used_classes:
+    for key, src in COMPAT_CLASSES.items():
         _pkg, cls = key
         with open(os.path.join(compat_root, f'{cls}.hx'), 'w', encoding='utf-8') as f:
-            f.write(COMPAT_CLASSES[key])
-    print(f'[sys.*] compat 클래스 생성 완료: {compat_root}')
-    return True  # __html5_compat_src source path 등록 필요
+            f.write(src)
+    print(f'[compat] 클래스 {len(COMPAT_CLASSES)}개 전부 생성 완료: {compat_root} '
+          f'({sorted(cls for _, cls in COMPAT_CLASSES.keys())})')
+    return True  # __html5_compat_src source path 항상 등록 필요
 
 
 # ── B) "데스크톱 전용 기능인데 define이 무조건 켜져있는" 패턴 범용 감지 ──────

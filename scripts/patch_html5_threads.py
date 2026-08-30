@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
 """
-[버그 수정] html5(JS) 빌드 컴파일 에러 근본 해결 — 스레드 API + "데스크톱 전용
-기능인데 define이 무조건 켜져있는" 패턴 둘 다 처리.
+[버그 수정] html5(JS) 빌드 컴파일 에러 근본 해결.
+  A) sys.thread.* / sys.io.* / sys.FileSystem 을 조건 없이 쓰는 엔진 코드
+  B) "데스크톱 전용 기능인데 define이 무조건 켜져있어서" 딸려 들어오는
+     플랫폼 제한 라이브러리(예: hxdiscord_rpc)
 
-배경 (겪은 순서대로):
-  1) ERROR sys/thread/FixedThreadPool.hx: This class is not available on this target
-     → Psych Engine의 LoadingState.hx/Discord.hx가 sys.thread.FixedThreadPool/
-       Mutex/Thread를 #if 조건 없이 무조건 import+사용. MULTITHREADED_LOADING
-       define은 스레드 "개수"만 바꿀 뿐 스레드풀 생성 자체를 막지 못해서
-       define을 손보는 것만으론 해결이 안 됐음.
-  2) ERROR hxdiscord_rpc/Discord.hx: 'Discord RPC supports only C++ target platforms.'
-     → 원인이 완전히 같은 패턴. Project.xml의 <define name="DISCORD_ALLOWED" />
-       가 if="desktop" 같은 조건 없이 무조건 켜져 있어서, html5 빌드에도
-       hxdiscord_rpc 라이브러리가 딸려 들어가고, 그 라이브러리 자체가 C++
-       타겟이 아니면 #error로 즉시 컴파일을 막아버림.
+겪은 사례들 (전부 같은 근본 패턴 — 엔진/모드 소스가 데스크톱을 기본
+가정하고 만들어져서, html5 타겟 조건을 빠뜨린 채 sys 패키지나 네이티브
+전용 라이브러리를 "무조건" 참조함):
 
-  → 이런 "데스크톱/네이티브 전용 기능인데 무조건 켜진 define" 패턴이 모드마다
-    다른 이름으로 계속 나올 수 있으므로, 하나씩 발견할 때마다 고치는 대신
-    범용적으로 자동 감지하도록 만든다.
+  1) sys/thread/FixedThreadPool.hx: This class is not available on this target
+     → LoadingState.hx/Discord.hx가 sys.thread.FixedThreadPool/Mutex/Thread를
+       #if 없이 무조건 import+사용.
+  2) hxdiscord_rpc/Discord.hx: 'Discord RPC supports only C++ target platforms.'
+     → Project.xml의 <define name="DISCORD_ALLOWED" />가 무조건 켜져 있어서
+       html5에도 hxdiscord_rpc가 딸려 들어감.
+  3) You cannot access the sys package while targeting js (for sys.io.File)
+     → 채보 에디터(FileDialogHandler.hx)가 sys.io.File.getContent를 조건
+       없이 사용. (참고: 같은 파일이 이미 #elseif (js && html5) 브랜치로
+       브라우저 파일 선택창까지는 구현해놨지만, 정작 그 뒤에 파일 "내용"을
+       읽는 부분만 데스크톱 전용 sys.io.File로 남아있었음 — 즉 업스트림
+       엔진 자체가 html5 채보 에디터 로드 기능은 원래도 불완전했음.
+       채보 에디터는 게임 플레이에는 쓰이지 않는 개발자 도구이므로, html5
+       에서는 이 기능만 조용히 비활성화하고 나머지는 그대로 빌드되게 한다.)
 
 해결 (2단계):
-  A) sys.thread.* 무조건 import → #if !html5 로 감싸고 동기 실행 대체
-     클래스(backend.__html5threadcompat.*)로 치환. (검증됨: 실제 빌드에서
-     FixedThreadPool 에러가 사라지고 다음 에러로 넘어간 것으로 확인)
-  B) Project.xml에서 <haxelib name="LIB" if="COND"/> 형태로 "COND일 때만
-     설치되는" 라이브러리를 찾고, 그 라이브러리가 실제 설치된 소스
-     (haxelib path LIB로 조회)에 플랫폼 제한 #error가 있는지 검사한다.
-     #error가 있고, COND가 Project.xml에서 if=/unless= 없이 완전히
-     무조건 정의된 define이면 → 그 define을 정의하는 원본
+  A) sys.thread.*, sys.io.File, sys.FileSystem 등 조건 없는 import를
+     #if !html5 로 감싸고, html5일 때는 동일한 이름의 메서드를 제공하는
+     대체 클래스(backend.__html5compat.*)로 치환한다. 스레드 계열은 동기
+     실행으로, 파일 계열은 "브라우저에는 없는 기능이니 조용히 무시"로
+     동작해 컴파일도 되고 런타임에도 죽지 않게 만든다.
+  B) Project.xml에서 <haxelib name="LIB" if="COND"/> 로 게이트된 라이브러리
+     중, 실제 설치된 소스(haxelib path LIB로 조회)에 플랫폼 제한 #error가
+     있고 COND가 if=/unless= 없이 완전히 무조건 정의된 define이면, 원본
      <define name="COND" /> 태그에 직접 unless="html5" 를 추가한다.
-     (Psych Engine 자신이 HSCRIPT_ALLOWED 등을 if="desktop"으로 올바르게
-     스코프하는 것과 완전히 동일한, 이미 검증된 패턴이라 가장 안전하다.)
+     (Psych Engine 자신이 HSCRIPT_ALLOWED 등을 if="desktop"으로 스코프하는
+     것과 동일한, 이미 검증된 패턴.)
 
 사용법:
   python3 patch_html5_threads.py <Project.xml 경로>
@@ -40,9 +45,13 @@ import re
 import subprocess
 import sys
 
-# ── A) sys.thread.* 대응 가능한 클래스와, html5용 동기 대체 구현 ──────────
+COMPAT_PACKAGE = "backend.__html5compat"
+COMPAT_FOLDER = "__html5compat"
+
+# ── A) 대응 가능한 sys.* 클래스와, html5용 대체 구현 ──────────────────────
+# key: (패키지 경로 "sys.thread" 등, 클래스명) → 대체 haxe 소스
 COMPAT_CLASSES = {
-    "FixedThreadPool": '''package backend.__html5threadcompat;
+    ("sys.thread", "FixedThreadPool"): f'''package {COMPAT_PACKAGE};
 
 /**
  * html5(JS)는 실제 OS 스레드를 지원하지 않는다. sys.thread.FixedThreadPool을
@@ -51,108 +60,153 @@ COMPAT_CLASSES = {
  * 넘겨받은 함수를 즉시 실행한다 — 단일 스레드 환경에서 결과적으로 동일하게
  * 동작하지만 병렬성은 없다(웹에서는 원래 불가능한 부분).
  */
-class FixedThreadPool {
-\tpublic function new(numThreads:Int = 1) {}
-\tpublic function run(work:Void->Void):Void {
+class FixedThreadPool {{
+\tpublic function new(numThreads:Int = 1) {{}}
+\tpublic function run(work:Void->Void):Void {{
 \t\tif (work != null) work();
-\t}
-\tpublic function shutdown():Void {}
-}
+\t}}
+\tpublic function shutdown():Void {{}}
+}}
 ''',
-    "ElasticThreadPool": '''package backend.__html5threadcompat;
+    ("sys.thread", "ElasticThreadPool"): f'''package {COMPAT_PACKAGE};
 
 /** FixedThreadPool과 동일한 이유로 대체된 동기 실행 버전. */
-class ElasticThreadPool {
-\tpublic function new(min:Int = 1, max:Int = 1) {}
-\tpublic function run(work:Void->Void):Void {
+class ElasticThreadPool {{
+\tpublic function new(min:Int = 1, max:Int = 1) {{}}
+\tpublic function run(work:Void->Void):Void {{
 \t\tif (work != null) work();
-\t}
-\tpublic function shutdown():Void {}
-}
+\t}}
+\tpublic function shutdown():Void {{}}
+}}
 ''',
-    "Mutex": '''package backend.__html5threadcompat;
+    ("sys.thread", "Mutex"): f'''package {COMPAT_PACKAGE};
 
 /** html5는 단일 스레드이므로 실제 잠금이 필요 없는 no-op Mutex 대체. */
-class Mutex {
-\tpublic function new() {}
-\tpublic function acquire():Void {}
-\tpublic function tryAcquire():Bool { return true; }
-\tpublic function release():Void {}
-}
+class Mutex {{
+\tpublic function new() {{}}
+\tpublic function acquire():Void {{}}
+\tpublic function tryAcquire():Bool {{ return true; }}
+\tpublic function release():Void {{}}
+}}
 ''',
-    "Lock": '''package backend.__html5threadcompat;
+    ("sys.thread", "Lock"): f'''package {COMPAT_PACKAGE};
 
 /** html5는 단일 스레드이므로 항상 즉시 통과하는 no-op Lock 대체. */
-class Lock {
-\tpublic function new() {}
-\tpublic function wait(?timeoutMs:Float):Bool { return true; }
-\tpublic function release():Void {}
-}
+class Lock {{
+\tpublic function new() {{}}
+\tpublic function wait(?timeoutMs:Float):Bool {{ return true; }}
+\tpublic function release():Void {{}}
+}}
 ''',
-    "Thread": '''package backend.__html5threadcompat;
+    ("sys.thread", "Thread"): f'''package {COMPAT_PACKAGE};
 
 /** html5는 실제 스레드가 없으므로 호출한 자리에서 즉시 실행하는 대체. */
-class Thread {
-\tpublic static function create(job:Void->Void):Thread {
+class Thread {{
+\tpublic static function create(job:Void->Void):Thread {{
 \t\tif (job != null) job();
 \t\treturn new Thread();
-\t}
-\tpublic static function current():Thread { return new Thread(); }
-\tpublic function new() {}
-}
+\t}}
+\tpublic static function current():Thread {{ return new Thread(); }}
+\tpublic function new() {{}}
+}}
 ''',
-    "Deque": '''package backend.__html5threadcompat;
+    ("sys.thread", "Deque"): f'''package {COMPAT_PACKAGE};
 
 /** html5는 단일 스레드이므로 단순 배열 기반의 동기 Deque 대체. */
-class Deque<T> {
+class Deque<T> {{
 \tvar items:Array<T> = [];
-\tpublic function new() {}
-\tpublic function add(i:T):Void { items.push(i); }
-\tpublic function push(i:T):Void { items.unshift(i); }
-\tpublic function pop(block:Bool):Null<T> {
+\tpublic function new() {{}}
+\tpublic function add(i:T):Void {{ items.push(i); }}
+\tpublic function push(i:T):Void {{ items.unshift(i); }}
+\tpublic function pop(block:Bool):Null<T> {{
 \t\treturn items.length > 0 ? items.shift() : null;
-\t}
-}
+\t}}
+}}
 ''',
-    "Tls": '''package backend.__html5threadcompat;
+    ("sys.thread", "Tls"): f'''package {COMPAT_PACKAGE};
 
 /** html5는 단일 스레드이므로 단순 값 저장소로 대체된 Tls. */
-class Tls<T> {
+class Tls<T> {{
 \tvar v:T;
-\tpublic function new() {}
+\tpublic function new() {{}}
 \tpublic var value(get, set):T;
 \tfunction get_value():T return v;
-\tfunction set_value(x:T):T { v = x; return v; }
-}
+\tfunction set_value(x:T):T {{ v = x; return v; }}
+}}
+''',
+    ("sys.io", "File"): f'''package {COMPAT_PACKAGE};
+
+/**
+ * html5(JS)는 로컬 파일시스템에 직접 접근할 수 없다. sys.io.File을 그대로
+ * 쓰면 컴파일 자체가 막히므로, 조용히 아무 동작도 하지 않는 대체 클래스로
+ * 치환한다 — 채보 에디터처럼 데스크톱 전용 보조 기능만 웹에서 비활성화
+ * 되고, 나머지 게임 로직은 정상적으로 빌드/실행된다.
+ */
+class File {{
+\tpublic static function getContent(path:String):String {{
+\t\ttrace('[html5] File.getContent 은 브라우저에서 지원되지 않습니다: ' + path);
+\t\treturn '';
+\t}}
+\tpublic static function saveContent(path:String, content:String):Void {{
+\t\ttrace('[html5] File.saveContent 은 브라우저에서 지원되지 않습니다: ' + path);
+\t}}
+\tpublic static function getBytes(path:String):haxe.io.Bytes {{
+\t\treturn haxe.io.Bytes.alloc(0);
+\t}}
+}}
+''',
+    ("sys", "FileSystem"): f'''package {COMPAT_PACKAGE};
+
+/** html5는 로컬 파일시스템이 없으므로 항상 "없음"으로 응답하는 대체. */
+class FileSystem {{
+\tpublic static function exists(path:String):Bool {{ return false; }}
+\tpublic static function isDirectory(path:String):Bool {{ return false; }}
+\tpublic static function readDirectory(path:String):Array<String> {{ return []; }}
+\tpublic static function createDirectory(path:String):Void {{}}
+\tpublic static function deleteFile(path:String):Void {{}}
+\tpublic static function rename(path:String, newPath:String):Void {{}}
+}}
 ''',
 }
 
-IMPORT_RE = re.compile(r'^([ \t]*)import\s+sys\.thread\.(\w+)\s*;[ \t]*$', re.MULTILINE)
+# import 문에서 잡아낼 패턴: sys.thread.X / sys.io.X / sys.FileSystem
+IMPORT_RE = re.compile(
+    r'^([ \t]*)import\s+(sys\.thread\.\w+|sys\.io\.\w+|sys\.FileSystem)\s*;[ \t]*$',
+    re.MULTILINE
+)
+
+
+def _lookup_compat(qualified):
+    """'sys.thread.FixedThreadPool' -> (('sys.thread','FixedThreadPool'), 'FixedThreadPool')"""
+    parts = qualified.split('.')
+    cls = parts[-1]
+    pkg = '.'.join(parts[:-1])
+    return (pkg, cls), cls
 
 
 def patch_hx_file(path, used_classes):
     with open(path, encoding='utf-8', errors='ignore') as f:
         content = f.read()
 
-    matches = list(IMPORT_RE.finditer(content))
-    if not matches:
+    if not IMPORT_RE.search(content):
         return False
 
     changed = False
 
     def _replace(m):
-        indent, cls = m.group(1), m.group(2)
-        if cls not in COMPAT_CLASSES:
-            print(f'[WARN] sys.thread.{cls} 는 아직 html5 대체 클래스가 없음 ({path})')
+        indent, qualified = m.group(1), m.group(2)
+        key, cls = _lookup_compat(qualified)
+        if key not in COMPAT_CLASSES:
+            print(f'[WARN] {qualified} 는 아직 html5 대체 클래스가 없음 ({path})')
             return m.group(0)
-        used_classes.add(cls)
+        used_classes.add(key)
         nonlocal changed
         changed = True
         return (
             f'{indent}#if !html5\n'
-            f'{indent}import sys.thread.{cls};\n'
+            f'{indent}import {qualified};\n'
             f'{indent}#else\n'
-            f'{indent}import backend.__html5threadcompat.{cls};\n'
+            f'{indent}import {COMPAT_PACKAGE}.{cls};\n'
             f'{indent}#end'
         )
 
@@ -163,12 +217,12 @@ def patch_hx_file(path, used_classes):
     return changed
 
 
-def patch_sys_thread(project_dir):
+def patch_sys_apis(project_dir):
     used_classes = set()
     patched_files = []
 
     for root, dirs, files in os.walk(project_dir):
-        dirs[:] = [d for d in dirs if d != '__html5_compat_src']
+        dirs[:] = [d for d in dirs if d != f'__html5_compat_src']
         for fn in files:
             if fn.endswith('.hx'):
                 fpath = os.path.join(root, fn)
@@ -179,19 +233,22 @@ def patch_sys_thread(project_dir):
                     print(f'[WARN] {fpath} 패치 중 오류(건너뜀): {e}')
 
     if not used_classes:
-        print('sys.thread.* 무조건 import 패턴 없음 — 패치 불필요')
+        print('sys.thread/io/FileSystem 무조건 import 패턴 없음 — 패치 불필요')
         return False
 
-    print(f'[sys.thread] 패치된 파일 {len(patched_files)}개, 대체 클래스: {sorted(used_classes)}')
+    print(f'[sys.*] 패치된 파일 {len(patched_files)}개, 대체 클래스: '
+          f'{sorted(cls for _, cls in used_classes)}')
     for f in patched_files:
         print(f'  - {f}')
 
-    compat_root = os.path.join(project_dir, '__html5_compat_src', 'backend', '__html5threadcompat')
+    compat_root = os.path.join(project_dir, '__html5_compat_src',
+                                *COMPAT_PACKAGE.split('.'))
     os.makedirs(compat_root, exist_ok=True)
-    for cls in used_classes:
+    for key in used_classes:
+        _pkg, cls = key
         with open(os.path.join(compat_root, f'{cls}.hx'), 'w', encoding='utf-8') as f:
-            f.write(COMPAT_CLASSES[cls])
-    print(f'[sys.thread] compat 클래스 생성 완료: {compat_root}')
+            f.write(COMPAT_CLASSES[key])
+    print(f'[sys.*] compat 클래스 생성 완료: {compat_root}')
     return True  # __html5_compat_src source path 등록 필요
 
 
@@ -201,7 +258,6 @@ HAXELIB_RE = re.compile(r'<haxelib\s+name="([^"]+)"([^>]*)/>')
 IF_ATTR_RE = re.compile(r'\bif="([^"]+)"')
 UNLESS_ATTR_RE = re.compile(r'\bunless="([^"]+)"')
 
-# 라이브러리 소스에서 플랫폼 제한을 알리는 전형적인 문구들
 PLATFORM_ERROR_HINTS = (
     'not available on this target',
     'target platform',
@@ -213,7 +269,6 @@ PLATFORM_ERROR_HINTS = (
 
 
 def haxelib_source_dir(lib_name):
-    """`haxelib path LIB` 결과에서 실제 소스 경로를 추출."""
     try:
         out = subprocess.run(
             ['haxelib', 'path', lib_name],
@@ -249,10 +304,6 @@ def dir_has_platform_error(src_dir):
 
 
 def find_risky_defines(xml_content):
-    """
-    if=/unless= 없이 무조건 정의된 define이면서, 그 define으로 게이트된
-    haxelib가 실제로는 플랫폼 제한(#error)이 있는 경우의 define 이름 목록.
-    """
     unconditional_defines = set()
     for m in DEFINE_TAG_RE.finditer(xml_content):
         name, attrs = m.group(1), m.group(2)
@@ -285,17 +336,12 @@ def find_risky_defines(xml_content):
 
 
 def apply_unless_html5(xml_content, define_name):
-    """
-    <define name="X" /> 원본 태그를 <define name="X" unless="html5" /> 로
-    직접 치환 (Psych Engine 자신이 다른 데스크톱 전용 define을 스코프하는
-    것과 동일한, 이미 검증된 패턴).
-    """
     def _sub(m):
         name, attrs = m.group(1), m.group(2)
         if name != define_name:
             return m.group(0)
         if 'unless=' in attrs or 'if=' in attrs:
-            return m.group(0)  # 이미 조건이 있으면 건드리지 않음
+            return m.group(0)
         return f'<define name="{name}"{attrs} unless="html5"/>'
 
     return DEFINE_TAG_RE.sub(_sub, xml_content, count=0)
@@ -309,17 +355,12 @@ def main():
     project_xml = sys.argv[1]
     project_dir = os.path.dirname(os.path.abspath(project_xml))
 
-    # A) sys.thread.* 치환
-    needs_compat_source_path = patch_sys_thread(project_dir)
+    needs_compat_source_path = patch_sys_apis(project_dir)
 
-    # B) 위험한 무조건 define 탐지 + 원본 define 태그 직접 수정
     with open(project_xml, encoding='utf-8') as f:
         xml_content = f.read()
 
     risky_defines = find_risky_defines(xml_content)
-    # MULTITHREADED_LOADING은 라이브러리 게이트가 아니라 엔진 자체 코드 문제라
-    # 위 B 탐지로는 안 잡힘. 이미 A에서 컴파일 에러 자체는 해결됐지만, 굳이
-    # 스레드풀을 만들 필요도 없으므로 성능상 같이 꺼둔다.
     if '<define name="MULTITHREADED_LOADING"' in xml_content:
         risky_defines.add('MULTITHREADED_LOADING')
 
@@ -335,7 +376,7 @@ def main():
         if '</project>' in xml_content:
             xml_content = xml_content.replace(
                 '</project>',
-                '\t<!-- [서버 자동 패치] sys.thread.* html5 동기 대체 클래스 경로 -->\n'
+                '\t<!-- [서버 자동 패치] sys.* html5 대체 클래스 경로 -->\n'
                 '\t<source path="__html5_compat_src" if="html5" />\n</project>'
             )
             source_path_added = True

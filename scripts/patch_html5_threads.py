@@ -184,12 +184,66 @@ def _lookup_compat(qualified):
     return (pkg, cls), cls
 
 
+# [버그 수정] "You cannot access the sys package while targeting js" 는
+# import 문 없이도 난다 — Paths.hx처럼 import 없이 그냥
+# "sys.FileSystem.exists(...)" 를 코드 안에서 직접 완전경로로 쓰는
+# 경우(Haxe는 이런 완전경로 인라인 참조를 허용함)는 IMPORT_RE(import
+# 문만 잡는 정규식)로는 절대 못 잡는다. 이런 인라인 참조를 전부 찾아서
+# "#if !html5 sys.FileSystem #else backend.__html5compat.FileSystem #end"
+# 형태로 감싼다 — 뒤에 붙는 .exists(...) 같은 메서드 호출부는 두 분기가
+# 동일한 API를 제공하므로 그대로 공통으로 남겨도 된다.
+QUALIFIED_INLINE_RE = re.compile(
+    r'\b(sys\.thread\.(?:FixedThreadPool|ElasticThreadPool|Mutex|Lock|Thread|Deque|Tls)'
+    r'|sys\.io\.File'
+    r'|sys\.FileSystem)\b(?!\s*;?\s*$)'
+)
+
+
+def patch_inline_qualified_refs(path, used_classes):
+    """import 문이 아니라 코드 중간에서 완전경로(sys.FileSystem.exists(...) 등)로
+    직접 쓰는 자리를 찾아 #if !html5 ... #else ... #end 로 감싼다."""
+    with open(path, encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+
+    changed = False
+    out_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # import 문 자체는 별도 로직(patch_hx_file)이 처리하므로 건너뜀.
+        # 이미 패치된 줄(#if !html5 재삽입 방지)도 건너뜀.
+        if stripped.startswith('import ') or '#if !html5' in line or '__html5compat' in line:
+            out_lines.append(line)
+            continue
+
+        def _replace(m):
+            qualified = m.group(1)
+            key, cls = _lookup_compat(qualified)
+            if key not in COMPAT_CLASSES:
+                print(f'[WARN] 인라인 참조 {qualified} 는 아직 html5 대체 클래스가 없음 ({path})')
+                return m.group(0)
+            used_classes.add(key)
+            nonlocal changed
+            changed = True
+            return f'(#if !html5 {qualified} #else {COMPAT_PACKAGE}.{cls} #end)'
+
+        new_line = QUALIFIED_INLINE_RE.sub(_replace, line)
+        out_lines.append(new_line)
+
+    if changed:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.writelines(out_lines)
+    return changed
+
+
 def patch_hx_file(path, used_classes):
+    # 1) 인라인 완전경로 참조 (import 없이 sys.FileSystem.exists(...) 처럼 쓰는 경우) 먼저 패치
+    inline_changed = patch_inline_qualified_refs(path, used_classes)
+
     with open(path, encoding='utf-8', errors='ignore') as f:
         content = f.read()
 
     if not IMPORT_RE.search(content):
-        return False
+        return inline_changed
 
     changed = False
 
@@ -214,7 +268,7 @@ def patch_hx_file(path, used_classes):
     if changed:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(new_content)
-    return changed
+    return changed or inline_changed
 
 
 def patch_sys_apis(project_dir):

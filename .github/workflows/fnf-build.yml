@@ -229,6 +229,15 @@ jobs:
             echo "Detected: flixel=$FLIXEL_VER openfl=$OPENFL_VER lime=$LIME_VER hxcpp=$HXCPP_VER"
           fi
 
+      - name: Restore haxelib cache
+        id: haxelib_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/haxelib
+          key: haxelib-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            haxelib-${{ runner.os }}-
+
       - name: Install haxelibs
         run: |
           haxelib setup ~/haxelib
@@ -320,6 +329,13 @@ jobs:
           haxelib run lime setup 2>/dev/null || true
           echo "=== 설치된 haxelibs ==="
           haxelib list
+
+      - name: Save haxelib cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/haxelib
+          key: haxelib-${{ runner.os }}-${{ github.run_id }}
 
       - name: Find Project.xml or .hxml
         id: find_project

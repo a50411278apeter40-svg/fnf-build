@@ -319,7 +319,7 @@ jobs:
           fi
 
           # 핵심 라이브러리 기본값 — Project.xml에 명시가 없을 때만 채워넣는다
-          CORE_LIBS="tjson:1.4.0 hscript: hxCodec: polymod: actuate: hxp: hxdiscord_rpc:"
+          CORE_LIBS="tjson:1.4.0 hscript: hxCodec: polymod: actuate: hxp: hxdiscord_rpc: flixel-ui: newgrounds:"
           for ENTRY in $CORE_LIBS; do
             LIB="${ENTRY%%:*}"
             VER="${ENTRY##*:}"

@@ -242,62 +242,16 @@ jobs:
         run: |
           haxelib setup ~/haxelib
 
-          # [버그 수정] 이전엔 hxdiscord_rpc 등 핵심 라이브러리를 버전 지정 없이
-          # "latest"로 먼저 깔아버린 뒤, Project.xml 전체 파싱 단계에서는 이미
-          # "설치된 이름"으로 취급해 건너뛰었다. 그 결과 모드가 Project.xml에
-          # 예: <haxelib name="hxdiscord_rpc" version="1.2.4" /> 로 특정 버전을
-          # 요구해도 실제로는 latest(1.3.0)만 설치되어 컴파일러가
-          # "Could not find haxelib hxdiscord_rpc version 1.2.4" 오류를 냈다.
-          # 수정: Project.xml에 명시된 haxelib(이름+버전)을 최우선으로 정확히
-          # 설치하고, 그 이후 핵심 라이브러리 기본값은 "아직 설치 안 된 것만" 채운다.
-          PROJECT_PATH=$(find $GITHUB_WORKSPACE/mod_src -name "Project.xml" | head -1 || true)
-          INSTALLED_FROM_PROJECT=""
-          if [ -n "$PROJECT_PATH" ]; then
-            echo "Project.xml 파싱 중(명시된 haxelib 우선 설치): $PROJECT_PATH"
-            python3 - "$PROJECT_PATH" << 'PY'
-          import xml.etree.ElementTree as ET, subprocess, sys
-          proj = sys.argv[1]
-          installed = []
-          try:
-              tree = ET.parse(proj)
-              for el in tree.iter():
-                  if el.tag == "haxelib":
-                      name = el.get("name", "").strip()
-                      ver = el.get("version", "").strip()
-                      if not name:
-                          continue
-                      installed.append(name.lower())
-                      cmd = ["haxelib", "install", name]
-                      if ver:
-                          cmd.append(ver)
-                      cmd.append("--quiet")
-                      print(f"==> Project.xml 명시 설치: {name} {ver or '(latest)'}")
-                      subprocess.run(cmd, check=False)
-                      if ver:
-                          subprocess.run(["haxelib", "set", name, ver], check=False)
-              with open("/tmp/installed_from_project.txt", "w") as f:
-                  f.write(" ".join(installed))
-          except Exception as e:
-              print(f"[WARN] Project.xml 파싱 오류: {e}", file=sys.stderr)
-          PY
-            INSTALLED_FROM_PROJECT=$(cat /tmp/installed_from_project.txt 2>/dev/null || true)
-          fi
-          echo "Project.xml에서 이미 설치된 라이브러리: $INSTALLED_FROM_PROJECT"
-
-          is_installed() {
-            case " $INSTALLED_FROM_PROJECT " in
-              *" $1 "*) return 0 ;;
-              *) return 1 ;;
-            esac
-          }
-
-          install_lib() {
+          # [근본 수정] 예전엔 여기서 (1) Project.xml 을 ElementTree 로 파싱해 명시된 haxelib 를 설치하고 (2) 설치한 이름을 기록해
+          # 뒤의 핵심 목록 단계가 "이미 설치됨"으로 건너뛰게 했다. 그런데
+          #   - 모드의 Project.xml 이 엄격한 XML 규격을 어기면(주석 안 '--', 이스케이프 안 된 '&' 등) 파서가 예외를 내고 그 예외를
+          #     삼켜서 haxelib 를 하나도 설치하지 않았다. lime 은 관대한 자체 파서로 읽기 때문에 이런 파일도 정상 빌드되어 모드에서 흔하다.
+          #   - 설치 명령의 성공 여부를 확인하지 않고 이름만 기록해, 실제로는 없는데도 건너뛰었다.
+          # 그 결과 'Could not find haxelib "flixel-ui"' 로 빌드가 실패했다(실행 35414419153).
+          # 이제는 scripts/ensure_haxelibs.py 가 (파서가 실패하면 정규식으로) 선언을 읽어 설치하고, 설치 뒤 'haxelib path' 로
+          # 실제 존재를 다시 확인한다. 필수 라이브러리가 끝내 없으면 이름을 밝히며 여기서 실패한다.
+          install_core() {
             LIB=$1; VER=$2
-            LOWER=$(echo "$LIB" | tr '[:upper:]' '[:lower:]')
-            if is_installed "$LOWER"; then
-              echo "==> $LIB 은 Project.xml에서 이미 설치됨 (건너뜀)"
-              return
-            fi
             if [ -n "$VER" ]; then
               echo "==> $LIB $VER 설치"
               haxelib install "$LIB" "$VER" --quiet 2>&1 | grep -v "^[0-9]" || true
@@ -308,23 +262,20 @@ jobs:
             fi
           }
 
-          install_lib lime      "${{ steps.detect_versions.outputs.lime_ver }}"
-          install_lib openfl    "${{ steps.detect_versions.outputs.openfl_ver }}"
-          install_lib flixel    "${{ steps.detect_versions.outputs.flixel_ver }}"
-          install_lib flixel-addons "${{ steps.detect_versions.outputs.flixel_addons_ver }}"
-          if [ -n "${{ steps.detect_versions.outputs.hxcpp_ver }}" ]; then
-            install_lib hxcpp "${{ steps.detect_versions.outputs.hxcpp_ver }}"
-          else
-            install_lib hxcpp ""
-          fi
+          # 앞 단계가 Project.xml 에서 찾아낸 정확한 버전(없으면 latest)으로 빌드 도구 본체를 먼저 맞춘다
+          install_core lime      "${{ steps.detect_versions.outputs.lime_ver }}"
+          install_core openfl    "${{ steps.detect_versions.outputs.openfl_ver }}"
+          install_core flixel    "${{ steps.detect_versions.outputs.flixel_ver }}"
+          install_core flixel-addons "${{ steps.detect_versions.outputs.flixel_addons_ver }}"
+          install_core hxcpp     "${{ steps.detect_versions.outputs.hxcpp_ver }}"
 
-          # 핵심 라이브러리 기본값 — Project.xml에 명시가 없을 때만 채워넣는다
-          CORE_LIBS="tjson:1.4.0 hscript: hxCodec: polymod: actuate: hxp: hxdiscord_rpc: flixel-ui: newgrounds:"
-          for ENTRY in $CORE_LIBS; do
-            LIB="${ENTRY%%:*}"
-            VER="${ENTRY##*:}"
-            install_lib "$LIB" "$VER"
-          done
+          PROJECT_PATH=$(find $GITHUB_WORKSPACE/mod_src -name "Project.xml" | head -1 || true)
+          curl -sf -o /tmp/ensure_haxelibs.py \
+            "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/scripts/ensure_haxelibs.py" \
+            || curl -sf -o /tmp/ensure_haxelibs.py \
+            "https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/ensure_haxelibs.py" \
+            || { echo "::error::scripts/ensure_haxelibs.py 를 내려받지 못했습니다"; exit 1; }
+          python3 /tmp/ensure_haxelibs.py "$PROJECT_PATH"
 
           haxelib run lime setup 2>/dev/null || true
           echo "=== 설치된 haxelibs ==="

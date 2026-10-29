@@ -296,5 +296,39 @@ class CommandLine(unittest.TestCase):
         self.assertIn('Project.xml', r.stdout + r.stderr)
 
 
+class RealFailingMod(unittest.TestCase):
+    """실행 35414419153 이 실패한 실제 모드(VS Dave and Bambi 3.0b)의 Project.xml 원본.
+    루트가 <project xmlns="http://lime.openfl.org/project/1.0.4" ...> 라서 ElementTree 의 el.tag 가
+    '{http://lime.openfl.org/project/1.0.4}haxelib' 로 나오고, 옛 코드의 el.tag == 'haxelib' 는 한 번도 참이 되지 않았다.
+    그래서 파싱 오류도 없이 haxelib 를 0개 찾았다."""
+    PATH = os.path.join(HERE, 'fixtures', 'vsdave_Project.xml')
+
+    def text(self):
+        return open(self.PATH, encoding='utf-8-sig').read()
+
+    def test_fixture_really_has_the_namespace_that_broke_the_old_code(self):
+        import xml.etree.ElementTree as ET
+        root = ET.parse(self.PATH).getroot()
+        self.assertTrue(root.tag.startswith('{http://lime.openfl.org/project/'), root.tag)
+        # 옛 방식(네임스페이스를 무시하지 않는 비교)으로는 하나도 못 찾는다 = 사고 재현
+        self.assertEqual([e for e in root.iter() if e.tag == 'haxelib'], [])
+
+    def test_all_eight_declarations_found(self):
+        libs = eh.find_declared_libs(self.text())
+        self.assertEqual(len(libs), 8)
+        self.assertIn('flixel-ui', names(libs))
+
+    def test_flixel_ui_is_required(self):
+        req = [l['name'] for l in eh.find_declared_libs(self.text()) if eh.is_required(l)]
+        self.assertIn('flixel-ui', req)
+
+    def test_flixel_ui_gets_installed_from_the_real_file(self):
+        calls = []
+        f = FakeHaxelib(calls, installable={'flixel', 'flixel-addons', 'hscript', 'actuate', 'flixel-ui', 'faxe', 'hxCodec', 'discord_rpc'})
+        res = eh.ensure(eh.find_declared_libs(self.text()), runner=f.run)
+        self.assertEqual(res['missing_required'], [])
+        self.assertIn('flixel-ui', f.installed)
+
+
 if __name__ == '__main__':
     unittest.main()
